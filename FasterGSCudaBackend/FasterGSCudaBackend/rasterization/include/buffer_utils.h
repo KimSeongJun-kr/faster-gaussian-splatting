@@ -53,6 +53,7 @@ namespace faster_gs::rasterization {
         float2* mean2d;
         float4* conic_opacity;
         float3* color;
+        float* depth;
         uint* n_visible_primitives;
         uint* n_instances;
 
@@ -74,6 +75,7 @@ namespace faster_gs::rasterization {
             obtain(blob, buffers.mean2d, n_primitives);
             obtain(blob, buffers.conic_opacity, n_primitives);
             obtain(blob, buffers.color, n_primitives);
+            obtain(blob, buffers.depth, n_primitives);
             cub::DeviceScan::ExclusiveSum(
                 nullptr, buffers.cub_workspace_size,
                 buffers.offset, buffers.offset,
@@ -154,11 +156,13 @@ namespace faster_gs::rasterization {
     struct BucketBuffers {
         uint* tile_index;
         float4* color_transmittance;
+        float* depth;
 
         static BucketBuffers from_blob(char*& blob, int n_buckets) {
             BucketBuffers buffers;
             obtain(blob, buffers.tile_index, n_buckets);
             obtain(blob, buffers.color_transmittance, n_buckets * config::block_size_blend);
+            obtain(blob, buffers.depth, n_buckets * config::block_size_blend);
             return buffers;
         }
     };

@@ -23,6 +23,8 @@ std::tuple<int, int, int> faster_gs::rasterization::forward(
     const float3* cam_position,
     const float3* bg_color,
     float* image,
+    float* alpha,
+    float* depth,
     const int n_primitives,
     const int active_sh_bases,
     const int total_sh_bases,
@@ -77,6 +79,7 @@ std::tuple<int, int, int> faster_gs::rasterization::forward(
         primitive_buffers.mean2d,
         primitive_buffers.conic_opacity,
         primitive_buffers.color,
+        primitive_buffers.depth,
         primitive_buffers.n_visible_primitives,
         primitive_buffers.n_instances,
         n_primitives,
@@ -140,6 +143,8 @@ std::tuple<int, int, int> faster_gs::rasterization::forward(
         block, \
         bg_color, \
         image, \
+        alpha, \
+        depth, \
         memset_stream, \
         n_visible_primitives, \
         n_instances, \
@@ -166,6 +171,8 @@ void faster_gs::rasterization::diff_rasterize(
     const dim3& block,
     const float3* bg_color,
     float* image,
+    float* alpha,
+    float* depth,
     const cudaStream_t memset_stream,
     const int n_visible_primitives,
     const int n_instances,
@@ -255,13 +262,17 @@ void faster_gs::rasterization::diff_rasterize(
         primitive_buffers.mean2d,
         primitive_buffers.conic_opacity,
         primitive_buffers.color,
+        primitive_buffers.depth,
         bg_color,
         image,
+        alpha,
+        depth,
         tile_buffers.final_transmittances,
         tile_buffers.max_n_processed,
         tile_buffers.n_processed,
         bucket_buffers.tile_index,
         bucket_buffers.color_transmittance,
+        bucket_buffers.depth,
         width,
         height,
         grid.x

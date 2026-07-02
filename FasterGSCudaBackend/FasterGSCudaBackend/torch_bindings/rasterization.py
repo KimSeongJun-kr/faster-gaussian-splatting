@@ -50,9 +50,9 @@ class _Rasterize(torch.autograd.Function):
         sh_coefficients_rest: torch.Tensor,
         densification_info: torch.Tensor,
         rasterizer_settings: RasterizerSettings,
-    ) -> torch.Tensor:
+    ) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor]':
         (
-            image,
+            image, alpha, depth,
             primitive_buffers, tile_buffers, instance_buffers, bucket_buffers,
             n_instances, n_buckets, instance_primitive_indices_selector
         ) = _C.forward(
@@ -68,6 +68,7 @@ class _Rasterize(torch.autograd.Function):
         ctx.buffer_state = (n_instances, n_buckets, instance_primitive_indices_selector)
         ctx.save_for_backward(
             image,
+            depth,
             means,
             scales,
             rotations,
@@ -80,20 +81,30 @@ class _Rasterize(torch.autograd.Function):
         )
         ctx.densification_info = densification_info
         ctx.mark_non_differentiable(densification_info)
-        return image
+        return image, alpha, depth
 
     @staticmethod
     @once_differentiable
     def backward(
         ctx: Any,
         grad_image: torch.Tensor,
+        grad_alpha: torch.Tensor,
+        grad_depth: torch.Tensor,
     ) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None, None]':
+        # materialize_grads is enabled by default, so unused outputs arrive as
+        # zero-filled tensors; the None guards are purely defensive.
+        if grad_alpha is None:
+            grad_alpha = torch.zeros_like(grad_image[:1])
+        if grad_depth is None:
+            grad_depth = torch.zeros_like(grad_image[:1])
         (
             grad_means, grad_scales, grad_rotations, grad_opacities,
             grad_sh_coefficients_0, grad_sh_coefficients_rest
         ) = _C.backward(
             ctx.densification_info,
             grad_image,
+            grad_alpha,
+            grad_depth,
             *ctx.saved_tensors,
             *ctx.rasterizer_settings.as_tuple(),
             *ctx.buffer_state,
@@ -119,7 +130,12 @@ def diff_rasterize(
     sh_coefficients_rest: torch.Tensor,
     densification_info: torch.Tensor,
     rasterizer_settings: RasterizerSettings,
-) -> torch.Tensor:
+) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor]':
+    """Returns (image (3,H,W), alpha (1,H,W), accumulated depth (1,H,W)).
+
+    The depth map is alpha-weighted accumulated depth; divide by alpha
+    (clamped) to obtain the expected depth.
+    """
     return _Rasterize.apply(
         means,
         scales,

@@ -27,6 +27,7 @@ namespace faster_gs::rasterization::kernels::forward {
         float2* __restrict__ primitive_mean2d,
         float4* __restrict__ primitive_conic_opacity,
         float3* __restrict__ primitive_color,
+        float* __restrict__ primitive_depth,
         uint* __restrict__ n_visible_primitives,
         uint* __restrict__ n_instances,
         const uint n_primitives,
@@ -201,6 +202,7 @@ namespace faster_gs::rasterization::kernels::forward {
             primitive_idx, active_sh_bases, total_sh_bases
         );
         primitive_color[primitive_idx] = color;
+        primitive_depth[primitive_idx] = depth;
 
         const uint offset = atomicAdd(n_visible_primitives, 1);
         const uint depth_key = __float_as_uint(depth);
@@ -367,13 +369,17 @@ namespace faster_gs::rasterization::kernels::forward {
         const float2* __restrict__ primitive_mean2d,
         const float4* __restrict__ primitive_conic_opacity,
         const float3* __restrict__ primitive_color,
+        const float* __restrict__ primitive_depth,
         const float3* __restrict__ bg_color,
         float* __restrict__ image,
+        float* __restrict__ alpha_map,
+        float* __restrict__ depth_map,
         float* __restrict__ tile_final_transmittances,
         uint* __restrict__ tile_max_n_processed,
         uint* __restrict__ tile_n_processed,
         uint* __restrict__ bucket_tile_index,
         float4* __restrict__ bucket_color_transmittance,
+        float* __restrict__ bucket_depth,
         const uint width,
         const uint height,
         const uint grid_width)
@@ -399,8 +405,10 @@ namespace faster_gs::rasterization::kernels::forward {
         __shared__ float2 collected_mean2d[config::block_size_blend];
         __shared__ float4 collected_conic_opacity[config::block_size_blend];
         __shared__ float3 collected_color[config::block_size_blend];
+        __shared__ float collected_depth[config::block_size_blend];
         // initialize local storage
         float3 color_pixel = make_float3(0.0f);
+        float depth_pixel = 0.0f;
         float transmittance = 1.0f;
         uint n_processed = 0;
         uint n_processed_and_used = 0;
@@ -414,6 +422,7 @@ namespace faster_gs::rasterization::kernels::forward {
                 collected_conic_opacity[thread_rank] = primitive_conic_opacity[primitive_idx];
                 const float3 color = fmaxf(primitive_color[primitive_idx], 0.0f);
                 collected_color[thread_rank] = color;
+                collected_depth[thread_rank] = primitive_depth[primitive_idx];
             }
             block.sync();
             const int current_batch_size = min(config::block_size_blend, n_points_remaining);
@@ -422,6 +431,7 @@ namespace faster_gs::rasterization::kernels::forward {
                 if (j % 32 == 0) {
                     const float4 current_color_transmittance = make_float4(color_pixel, transmittance);
                     bucket_color_transmittance[bucket_offset * config::block_size_blend + thread_rank] = current_color_transmittance;
+                    bucket_depth[bucket_offset * config::block_size_blend + thread_rank] = depth_pixel;
                     bucket_offset++;
                 }
 
@@ -439,8 +449,10 @@ namespace faster_gs::rasterization::kernels::forward {
                 const float alpha = opacity * gaussian;
                 if (config::original_opacity_interpretation && alpha < config::min_alpha_threshold) continue;
 
-                // blend fragment into pixel color
-                color_pixel += transmittance * alpha * collected_color[j];
+                // blend fragment into pixel color and expected depth
+                const float blending_weight = transmittance * alpha;
+                color_pixel += blending_weight * collected_color[j];
+                depth_pixel += blending_weight * collected_depth[j];
 
                 // update transmittance
                 transmittance *= 1.0f - alpha;
@@ -465,6 +477,8 @@ namespace faster_gs::rasterization::kernels::forward {
             image[n_pixels + pixel_idx] = color_pixel.y;
             image[2 * n_pixels + pixel_idx] = color_pixel.z;
             tile_final_transmittances[pixel_idx] = transmittance;
+            alpha_map[pixel_idx] = 1.0f - transmittance;
+            depth_map[pixel_idx] = depth_pixel;
             tile_n_processed[pixel_idx] = n_processed_and_used;
         }
         // max reduce the number of processed Gaussians per tile
