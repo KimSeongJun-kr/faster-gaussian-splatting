@@ -24,13 +24,22 @@ class FusedAdam(torch.optim.Adam):
 
             state['step'] += 1
 
-            _C.adam_step(
-                param.grad,
-                param,
-                state['exp_avg'],
-                state['exp_avg_sq'],
-                state['step'],
-                group['lr'],
-                *group['betas'],
-                group['eps'],
-            )
+            try:
+                _C.adam_step(
+                    param.grad,
+                    param,
+                    state['exp_avg'],
+                    state['exp_avg_sq'],
+                    state['step'],
+                    group['lr'],
+                    *group['betas'],
+                    group['eps'],
+                )
+            except RuntimeError as e:
+                raise RuntimeError(
+                    f"[FusedAdam] group='{group.get('name')}' param.shape={tuple(param.shape)} "
+                    f"param.is_contiguous={param.is_contiguous()} "
+                    f"param.grad.is_contiguous={param.grad.is_contiguous()} "
+                    f"exp_avg.is_contiguous={state['exp_avg'].is_contiguous()} "
+                    f"exp_avg_sq.is_contiguous={state['exp_avg_sq'].is_contiguous()}: {e}"
+                ) from e

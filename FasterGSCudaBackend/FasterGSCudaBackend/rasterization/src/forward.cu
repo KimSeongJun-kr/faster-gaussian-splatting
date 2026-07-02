@@ -233,6 +233,18 @@ void faster_gs::rasterization::diff_rasterize(
 
     cudaMemcpy(&n_buckets, tile_buffers.buckets_offset + n_tiles - 1, sizeof(uint), cudaMemcpyDeviceToHost);
 
+    if (n_buckets <= 0) {
+        // Turns the otherwise-fatal `<<<n_buckets, 32>>>` launch (invalid
+        // configuration argument) into a clear, catchable error instead of a
+        // CUDA driver crash. Should not trigger in practice: callers are
+        // expected to skip isolated-class renders with zero visible
+        // primitives (see BasicTrainer._class_visible_in_view).
+        throw std::runtime_error(
+            "n_buckets is non-positive (" + std::to_string(n_buckets) +
+            "): the render has zero visible primitives for this camera/class."
+        );
+    }
+
     char* bucket_buffers_blob = resize_bucket_buffers(required<BucketBuffers>(n_buckets));
     BucketBuffers bucket_buffers = BucketBuffers::from_blob(bucket_buffers_blob, n_buckets);
 

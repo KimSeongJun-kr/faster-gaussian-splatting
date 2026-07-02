@@ -51,6 +51,15 @@ void faster_gs::rasterization::backward(
     TileBuffers tile_buffers = TileBuffers::from_blob(tile_buffers_blob, n_tiles);
     BucketBuffers bucket_buffers = BucketBuffers::from_blob(bucket_buffers_blob, n_buckets);
 
+    if (n_buckets <= 0) {
+        // Same rationale as the forward-pass check in forward.cu: turn the
+        // otherwise-fatal `<<<n_buckets, 32>>>` launch into a catchable error.
+        throw std::runtime_error(
+            "n_buckets is non-positive (" + std::to_string(n_buckets) +
+            "): the render has zero visible primitives for this camera/class."
+        );
+    }
+
     // note that with c++20 one could use a templated lambda to improve readability here
     auto dispatch_rasterize_backward = [&](const uint* instance_primitive_indices) {
         kernels::backward::blend_backward_cu<<<n_buckets, 32>>>(
