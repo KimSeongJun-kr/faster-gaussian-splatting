@@ -17,6 +17,7 @@ from Methods.FasterGS.FasterGSCudaBackend import FusedAdam, update_3d_filter, re
 from Optim.adam_utils import replace_param_group_data, prune_param_groups, extend_param_groups, sort_param_groups, reset_state
 from Optim.lr_utils import LRDecayPolicy
 from Optim.knn_utils import compute_root_mean_squared_knn_distances
+from Optim.ppisp import PPISPWrapper
 
 
 class Gaussians(torch.nn.Module):
@@ -539,6 +540,11 @@ class Gaussians(torch.nn.Module):
 
 @Framework.Configurable.configure(
     SH_DEGREE=3,
+    PPISP=Framework.ConfigParameterList(
+        USE=False,
+        CONTROLLER_TRAINING_STEPS=5_000,
+        CONTROLLER_DISTILLATION=True,
+    ),
 )
 class FasterGSModel(BaseModel):
     """Defines the FasterGS model."""
@@ -546,11 +552,14 @@ class FasterGSModel(BaseModel):
     def __init__(self, name: str = None) -> None:
         super().__init__(name)
         self.gaussians: Gaussians | None = None
+        self.ppisp: PPISPWrapper | None = None
 
     def build(self) -> 'FasterGSModel':
         """Builds the model."""
         pretrained = self.num_iterations_trained > 0
         self.gaussians = Gaussians(self.SH_DEGREE, pretrained)
+        if self.PPISP.USE:
+            self.ppisp = PPISPWrapper(self.PPISP)
         return self
 
     def get_ply_dict(self) -> dict[str, np.ndarray | list[str]]:

@@ -34,7 +34,8 @@ void faster_gs::rasterization::inference(
     const float near_plane,
     const float far_plane,
     const bool proper_antialiasing,
-    const bool to_chw)
+    const bool to_chw,
+    const bool clamp_output)
 {
     const dim3 grid(div_round_up(width, config::tile_width), div_round_up(height, config::tile_height), 1);
     const dim3 block(config::tile_width, config::tile_height, 1);
@@ -144,7 +145,8 @@ void faster_gs::rasterization::inference(
         end_bit, \
         width, \
         height, \
-        to_chw
+        to_chw, \
+        clamp_output
     if (end_bit <= 16) rasterize<ushort>(RASTERIZE_ARGS);
     else rasterize<uint>(RASTERIZE_ARGS);
     #undef RASTERIZE_ARGS
@@ -165,7 +167,8 @@ void faster_gs::rasterization::rasterize(
     const int end_bit,
     const int width,
     const int height,
-    const bool to_chw)
+    const bool to_chw,
+    const bool clamp_output)
 {
     char* instance_buffers_blob = resize_instance_buffers(required<InstanceBuffers<KeyT>>(n_instances, end_bit));
     InstanceBuffers<KeyT> instance_buffers = InstanceBuffers<KeyT>::from_blob(instance_buffers_blob, n_instances, end_bit);
@@ -215,7 +218,8 @@ void faster_gs::rasterization::rasterize(
         width,
         height,
         grid.x,
-        to_chw
+        to_chw,
+        clamp_output
     );
     CHECK_CUDA(config::debug, "blend")
 }

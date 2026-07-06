@@ -76,7 +76,7 @@ class FasterGSTrainer(GuiTrainer):
                 Logger.log_info('using "expandable_segments:True" with the torch cuda memory allocator')
         super().__init__(**kwargs)
         self.train_sampler = None
-        self.loss = FasterGSLoss(loss_config=self.LOSS, gaussians=self.model.gaussians)
+        self.loss = None
 
     @pre_training_callback(priority=50)
     @torch.no_grad()
@@ -107,6 +107,9 @@ class FasterGSTrainer(GuiTrainer):
             self.model.gaussians.reset_densification_info()
         if self.FILTER_3D.USE:
             self.model.gaussians.setup_3d_filter(self.FILTER_3D, dataset)
+        if self.model.ppisp is not None:
+            self.model.ppisp.initialize(dataset, self.NUM_ITERATIONS)
+        self.loss = FasterGSLoss(loss_config=self.LOSS, model=self.model)
 
     @training_callback(priority=110, start_iteration=1000, iteration_stride=1000)
     @torch.no_grad()
@@ -194,6 +197,8 @@ class FasterGSTrainer(GuiTrainer):
         self.model.gaussians.optimizer.step()
         self.model.gaussians.optimizer.zero_grad()
         self.model.gaussians.post_optimizer_step(inject_noise=self.USE_MCMC)
+        if self.model.ppisp is not None:
+            self.model.ppisp.step()
 
     @training_callback(active='SPEEDYSPLAT_PRUNING.USE', priority=70, start_iteration='SPEEDYSPLAT_PRUNING.START_ITERATION', end_iteration='SPEEDYSPLAT_PRUNING.END_ITERATION', iteration_stride='SPEEDYSPLAT_PRUNING.INTERVAL')
     @torch.no_grad()
@@ -215,7 +220,7 @@ class FasterGSTrainer(GuiTrainer):
 
     @post_training_callback(priority=1000)
     @torch.no_grad()
-    def finalize(self, *_) -> None:
+    def finalize(self, _, dataset: 'BaseDataset') -> None:
         """Clean up after training."""
         n_gaussians = self.model.gaussians.training_cleanup(min_opacity=self.MIN_OPACITY_AFTER_TRAINING)
         Logger.log_info(f'final number of Gaussians: {n_gaussians:,}')
@@ -225,3 +230,25 @@ class FasterGSTrainer(GuiTrainer):
                 f'\n'
                 f'N_Gaussians:{n_gaussians}'
             )
+        if self.model.ppisp is not None and self.model.ppisp.config.controller_distillation:
+            Logger.log_info(f'distilling PPISP controller')
+            with torch.enable_grad():
+                self.model.train()
+                dataset.train()
+                self.loss.train()
+                for _ in Logger.log_progress(range(self.model.ppisp.config.controller_training_steps)):
+                    # get random view
+                    view = self.train_sampler.get(dataset=dataset)['view']
+                    # render
+                    image = self.renderer.ppisp_controller_distillation(view=view)
+                    # calculate loss
+                    # compose gt with background color if needed  # FIXME: integrate into data model
+                    rgb_gt = view.rgb
+                    if (alpha_gt := view.alpha) is not None:
+                        rgb_gt = apply_background_color(rgb_gt, alpha_gt, view.camera.background_color)
+                    loss = self.loss(image, rgb_gt)
+                    # backward
+                    loss.backward()
+                    # optimizer step
+                    self.model.ppisp.step()
+            self.model.ppisp.create_report(self.output_directory)

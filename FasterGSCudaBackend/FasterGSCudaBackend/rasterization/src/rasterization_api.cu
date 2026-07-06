@@ -208,7 +208,8 @@ faster_gs::rasterization::inference_wrapper(
     const float near_plane,
     const float far_plane,
     const bool proper_antialiasing,
-    const bool to_chw)
+    const bool to_chw,
+    const bool clamp_output)
 {
     const int n_primitives = means.size(0);
     const int total_sh_bases = sh_coefficients_rest.size(1);
@@ -248,7 +249,8 @@ faster_gs::rasterization::inference_wrapper(
         near_plane,
         far_plane,
         proper_antialiasing,
-        to_chw
+        to_chw,
+        clamp_output
     );
 
     return image;

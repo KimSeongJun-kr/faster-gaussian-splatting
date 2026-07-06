@@ -157,6 +157,7 @@ def rasterize(
     sh_coefficients_rest: torch.Tensor,
     rasterizer_settings: RasterizerSettings,
     to_chw: bool,
+    clamp_output: bool = True,
 ) -> torch.Tensor:
     return _C.inference(
         means,
@@ -167,6 +168,7 @@ def rasterize(
         sh_coefficients_rest,
         *rasterizer_settings.as_tuple(),
         to_chw,
+        clamp_output,
     )
 
 

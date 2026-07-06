@@ -357,7 +357,8 @@ namespace faster_gs::rasterization::kernels::inference {
         const uint width,
         const uint height,
         const uint grid_width,
-        const bool output_chw)
+        const bool output_chw,
+        const bool clamp_output)
     {
         auto block = cg::this_thread_block();
         const dim3 group_index = block.group_index();
@@ -416,17 +417,22 @@ namespace faster_gs::rasterization::kernels::inference {
             color_pixel += transmittance * bg_color[0];
             // store results
             const uint pixel_idx = width * pixel_coords.y + pixel_coords.x;
+            if (clamp_output) {
+                color_pixel.x = __saturatef(color_pixel.x);
+                color_pixel.y = __saturatef(color_pixel.y);
+                color_pixel.z = __saturatef(color_pixel.z);
+            }
             if (output_chw) {
                 const uint n_pixels = width * height;
-                image[pixel_idx] = __saturatef(color_pixel.x);
-                image[n_pixels + pixel_idx] = __saturatef(color_pixel.y);
-                image[2 * n_pixels + pixel_idx] = __saturatef(color_pixel.z);
+                image[pixel_idx] = color_pixel.x;
+                image[n_pixels + pixel_idx] = color_pixel.y;
+                image[2 * n_pixels + pixel_idx] = color_pixel.z;
             }
             else {
                 const uint base_idx = 3 * pixel_idx;
-                image[base_idx] = __saturatef(color_pixel.x);
-                image[base_idx + 1] = __saturatef(color_pixel.y);
-                image[base_idx + 2] = __saturatef(color_pixel.z);
+                image[base_idx] = color_pixel.x;
+                image[base_idx + 1] = color_pixel.y;
+                image[base_idx + 2] = color_pixel.z;
             }
         }
     }

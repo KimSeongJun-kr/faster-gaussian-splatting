@@ -32,7 +32,8 @@ namespace faster_gs::rasterization {
         const float near_plane,
         const float far_plane,
         const bool proper_antialiasing,
-        const bool to_chw);
+        const bool to_chw,
+        const bool clamp_output);
 
     template <typename KeyT>
     void rasterize(
@@ -49,6 +50,7 @@ namespace faster_gs::rasterization {
         const int end_bit,
         const int width,
         const int height,
-        const bool to_chw);
+        const bool to_chw,
+        const bool clamp_output);
 
 }

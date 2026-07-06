@@ -78,6 +78,8 @@ class FasterGSRenderer(BaseRenderer):
             densification_info=self.model.gaussians.densification_info if update_densification_info else torch.empty(0),
             rasterizer_settings=extract_settings(view, self.model.gaussians.active_sh_bases, bg_color, self.PROPER_ANTIALIASING),
         )
+        if self.model.ppisp is not None:
+            image = self.model.ppisp(image, view)
         return image
 
     @torch.no_grad()
@@ -93,7 +95,10 @@ class FasterGSRenderer(BaseRenderer):
             densification_info=torch.empty(0),
             rasterizer_settings=extract_settings(view, self.model.gaussians.active_sh_bases, view.camera.background_color, self.PROPER_ANTIALIASING),
         )
-        image = image.clamp(0.0, 1.0)
+        if self.model.ppisp is not None:
+            image = self.model.ppisp(image, view)
+        else:
+            image = image.clamp(0.0, 1.0)
         return {'rgb': image if to_chw else image.permute(1, 2, 0)}
 
     @torch.inference_mode()
@@ -107,9 +112,28 @@ class FasterGSRenderer(BaseRenderer):
             sh_coefficients_0=self.model.gaussians.sh_coefficients_0,
             sh_coefficients_rest=self.model.gaussians.sh_coefficients_rest,
             rasterizer_settings=extract_settings(view, self.model.gaussians.active_sh_bases, view.camera.background_color, self.PROPER_ANTIALIASING),
-            to_chw=to_chw
+            to_chw=to_chw,
+            clamp_output=self.model.ppisp is None,
         )
+        if self.model.ppisp is not None:
+            image = self.model.ppisp(image, view)
         return {'rgb': image}
+
+    def ppisp_controller_distillation(self, view: View) -> torch.Tensor:
+        """Renders an image for a given view where only the PPISP module will receive gradients."""
+        image = rasterize(
+            means=self.model.gaussians.means,
+            scales=self.model.gaussians.raw_scales,
+            rotations=self.model.gaussians.raw_rotations,
+            opacities=self.model.gaussians.raw_opacities,
+            sh_coefficients_0=self.model.gaussians.sh_coefficients_0,
+            sh_coefficients_rest=self.model.gaussians.sh_coefficients_rest,
+            rasterizer_settings=extract_settings(view, self.model.gaussians.active_sh_bases, view.camera.background_color, self.PROPER_ANTIALIASING),
+            to_chw=True,
+            clamp_output=False,
+        )
+        image = self.model.ppisp(image, view)
+        return image
 
     @torch.inference_mode()
     def compute_pruning_scores(self, dataset: BaseDataset) -> torch.Tensor:
