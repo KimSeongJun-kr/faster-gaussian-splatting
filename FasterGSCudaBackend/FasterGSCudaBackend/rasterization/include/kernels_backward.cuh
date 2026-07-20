@@ -8,6 +8,7 @@
 #include "utils.h"
 #include <cstdint>
 #include <cooperative_groups.h>
+#include <cooperative_groups/reduce.h>
 namespace cg = cooperative_groups;
 
 namespace faster_gs::rasterization::kernels::backward {
@@ -30,6 +31,7 @@ namespace faster_gs::rasterization::kernels::backward {
         float3* __restrict__ grad_sh_coefficients_0,
         float3* __restrict__ grad_sh_coefficients_rest,
         float* __restrict__ densification_info,
+        float* __restrict__ grad_w2c,
         const uint n_primitives,
         const uint active_sh_bases,
         const uint total_sh_bases,
@@ -215,6 +217,30 @@ namespace faster_gs::rasterization::kernels::backward {
         const float factor_x = 1.0f + static_cast<float>(valid_x);
         const float factor_y = 1.0f + static_cast<float>(valid_y);
         dL_dmean3d_cam.z += (j11 * (factor_x * x_clipped * dL_dj13 - dL_dj11) + j22 * (factor_y * y_clipped * dL_dj23 - dL_dj22)) / depth;
+
+        // camera pose gradient: mean3d_cam = W * mean3d + t with [W | t] = the top three
+        // w2c rows, so d/dW[row] = dL_dmean3d_cam[row] * [mean3d, 1]. The covariance
+        // path through W and the SH view-direction path are omitted (geometry-only
+        // approximation). All threads surviving the guard above reach this uniformly,
+        // so the coalesced group is well defined; non-finite entries contribute zero
+        // instead of leaving the reduction.
+        if (grad_w2c != nullptr) {
+            const float dL_dmean_cam[3] = {dL_dmean3d_cam.x, dL_dmean3d_cam.y, dL_dmean3d_cam.z};
+            const float mean_hom[4] = {mean3d.x, mean3d.y, mean3d.z, 1.0f};
+            const bool finite =
+                isfinite(dL_dmean_cam[0]) && isfinite(dL_dmean_cam[1]) && isfinite(dL_dmean_cam[2]) &&
+                isfinite(mean3d.x) && isfinite(mean3d.y) && isfinite(mean3d.z);
+            const cg::coalesced_group active_threads = cg::coalesced_threads();
+            #pragma unroll
+            for (int row = 0; row < 3; row++) {
+                #pragma unroll
+                for (int col = 0; col < 4; col++) {
+                    const float contribution = finite ? dL_dmean_cam[row] * mean_hom[col] : 0.0f;
+                    const float group_sum = cg::reduce(active_threads, contribution, cg::plus<float>());
+                    if (active_threads.thread_rank() == 0) atomicAdd(&grad_w2c[4 * row + col], group_sum);
+                }
+            }
+        }
 
         // 3d mean gradient from splatting
         const float3 dL_dmean3d_from_splatting = make_float3(

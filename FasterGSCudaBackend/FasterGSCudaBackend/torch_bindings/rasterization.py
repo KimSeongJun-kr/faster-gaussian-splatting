@@ -1,4 +1,4 @@
-from typing import NamedTuple, Any
+from typing import NamedTuple, Any, Optional
 import torch
 from torch.autograd.function import once_differentiable
 
@@ -49,6 +49,7 @@ class _Rasterize(torch.autograd.Function):
         sh_coefficients_0: torch.Tensor,
         sh_coefficients_rest: torch.Tensor,
         densification_info: torch.Tensor,
+        w2c: torch.Tensor,
         rasterizer_settings: RasterizerSettings,
     ) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor]':
         (
@@ -62,7 +63,10 @@ class _Rasterize(torch.autograd.Function):
             opacities,
             sh_coefficients_0,
             sh_coefficients_rest,
-            *rasterizer_settings.as_tuple(),
+            # the explicit (differentiable) w2c replaces the settings copy,
+            # which occupies the first as_tuple() slot
+            w2c,
+            *rasterizer_settings.as_tuple()[1:],
         )
         ctx.rasterizer_settings = rasterizer_settings
         ctx.buffer_state = (n_instances, n_buckets, instance_primitive_indices_selector)
@@ -78,6 +82,7 @@ class _Rasterize(torch.autograd.Function):
             tile_buffers,
             instance_buffers,
             bucket_buffers,
+            w2c,
         )
         ctx.densification_info = densification_info
         ctx.mark_non_differentiable(densification_info)
@@ -90,24 +95,30 @@ class _Rasterize(torch.autograd.Function):
         grad_image: torch.Tensor,
         grad_alpha: torch.Tensor,
         grad_depth: torch.Tensor,
-    ) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None, None]':
+    ) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None, Optional[torch.Tensor], None]':
         # materialize_grads is enabled by default, so unused outputs arrive as
         # zero-filled tensors; the None guards are purely defensive.
         if grad_alpha is None:
             grad_alpha = torch.zeros_like(grad_image[:1])
         if grad_depth is None:
             grad_depth = torch.zeros_like(grad_image[:1])
+        *saved, w2c = ctx.saved_tensors
+        compute_w2c_grad = ctx.needs_input_grad[7]
         (
             grad_means, grad_scales, grad_rotations, grad_opacities,
-            grad_sh_coefficients_0, grad_sh_coefficients_rest
+            grad_sh_coefficients_0, grad_sh_coefficients_rest, grad_w2c
         ) = _C.backward(
             ctx.densification_info,
             grad_image,
             grad_alpha,
             grad_depth,
-            *ctx.saved_tensors,
-            *ctx.rasterizer_settings.as_tuple(),
+            *saved,
+            # w2c sits in its usual positional slot (first as_tuple() entry);
+            # compute_w2c_grad is appended after buffer_state
+            w2c,
+            *ctx.rasterizer_settings.as_tuple()[1:],
             *ctx.buffer_state,
+            compute_w2c_grad,
         )
         return (
             grad_means,
@@ -117,6 +128,7 @@ class _Rasterize(torch.autograd.Function):
             grad_sh_coefficients_0,
             grad_sh_coefficients_rest,
             None,  # densification_info
+            grad_w2c if compute_w2c_grad else None,
             None,  # rasterizer_settings
         )
 
@@ -130,12 +142,21 @@ def diff_rasterize(
     sh_coefficients_rest: torch.Tensor,
     densification_info: torch.Tensor,
     rasterizer_settings: RasterizerSettings,
+    w2c: Optional[torch.Tensor] = None,
 ) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor]':
     """Returns (image (3,H,W), alpha (1,H,W), accumulated depth (1,H,W)).
 
     The depth map is alpha-weighted accumulated depth; divide by alpha
     (clamped) to obtain the expected depth.
+
+    Pass `w2c` to make the view matrix a differentiable input (camera pose
+    gradients); it takes precedence over `rasterizer_settings.w2c`. The
+    returned gradient covers the geometric path only (mean projection incl.
+    the Jacobian-through-depth term) — covariance-through-W and SH
+    view-direction contributions are omitted.
     """
+    if w2c is None:
+        w2c = rasterizer_settings.w2c
     return _Rasterize.apply(
         means,
         scales,
@@ -144,6 +165,7 @@ def diff_rasterize(
         sh_coefficients_0,
         sh_coefficients_rest,
         densification_info,
+        w2c.contiguous(),
         rasterizer_settings,
     )
 

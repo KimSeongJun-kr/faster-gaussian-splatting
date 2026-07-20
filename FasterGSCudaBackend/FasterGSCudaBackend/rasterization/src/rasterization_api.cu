@@ -94,7 +94,7 @@ faster_gs::rasterization::forward_wrapper(
     };
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 faster_gs::rasterization::backward_wrapper(
     torch::Tensor& densification_info,
     const torch::Tensor& grad_image,
@@ -126,7 +126,8 @@ faster_gs::rasterization::backward_wrapper(
     const bool proper_antialiasing,
     const int n_instances,
     const int n_buckets,
-    const int instance_primitive_indices_selector)
+    const int instance_primitive_indices_selector,
+    const bool compute_w2c_grad)
 {
     const int n_primitives = means.size(0);
     const int total_sh_bases = sh_coefficients_rest.size(1);
@@ -139,6 +140,9 @@ faster_gs::rasterization::backward_wrapper(
     torch::Tensor grad_sh_coefficients_rest = torch::zeros({n_primitives, total_sh_bases, 3}, float_options);
     torch::Tensor grad_mean2d_helper = torch::zeros({n_primitives, 2}, float_options);
     torch::Tensor grad_conic_helper = torch::zeros({3, n_primitives}, float_options);
+    torch::Tensor grad_w2c = compute_w2c_grad
+        ? torch::zeros({4, 4}, float_options)
+        : torch::empty({0}, float_options);
 
     const bool update_densification_info = densification_info.size(0) > 0;
 
@@ -169,6 +173,7 @@ faster_gs::rasterization::backward_wrapper(
         reinterpret_cast<float2*>(grad_mean2d_helper.data_ptr<float>()),
         grad_conic_helper.data_ptr<float>(),
         update_densification_info ? densification_info.data_ptr<float>() : nullptr,
+        compute_w2c_grad ? grad_w2c.data_ptr<float>() : nullptr,
         n_primitives,
         n_instances,
         n_buckets,
@@ -184,7 +189,7 @@ faster_gs::rasterization::backward_wrapper(
         proper_antialiasing
     );
 
-    return {grad_means, grad_scales, grad_rotations, grad_opacities, grad_sh_coefficients_0, grad_sh_coefficients_rest};
+    return {grad_means, grad_scales, grad_rotations, grad_opacities, grad_sh_coefficients_0, grad_sh_coefficients_rest, grad_w2c};
 }
 
 torch::Tensor

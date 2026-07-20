@@ -27,7 +27,7 @@ namespace faster_gs::rasterization {
         const float far_plane,
         const bool proper_antialiasing);
 
-    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+    std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
     backward_wrapper(
         torch::Tensor& densification_info,
         const torch::Tensor& grad_image,
@@ -59,7 +59,8 @@ namespace faster_gs::rasterization {
         const bool proper_antialiasing,
         const int n_instances,
         const int n_buckets,
-        const int instance_primitive_indices_selector);
+        const int instance_primitive_indices_selector,
+        const bool compute_w2c_grad);
 
     torch::Tensor
     inference_wrapper(
