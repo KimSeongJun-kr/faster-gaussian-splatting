@@ -7,6 +7,7 @@
 #include "helper_math.h"
 #include "utils.h"
 #include <cooperative_groups.h>
+#include <cuda/functional>  // cuda::maximum — replaces cub::Max (removed in CUDA 13 / CCCL 3.0)
 namespace cg = cooperative_groups;
 
 namespace faster_gs::rasterization::kernels::forward {
@@ -484,7 +485,7 @@ namespace faster_gs::rasterization::kernels::forward {
         // max reduce the number of processed Gaussians per tile
         typedef cub::BlockReduce<uint, config::tile_width, cub::BLOCK_REDUCE_WARP_REDUCTIONS, config::tile_height> BlockReduce;
         __shared__ typename BlockReduce::TempStorage temp_storage;
-        n_processed_and_used = BlockReduce(temp_storage).Reduce(n_processed_and_used, cub::Max());
+        n_processed_and_used = BlockReduce(temp_storage).Reduce(n_processed_and_used, cuda::maximum<uint>{});
         if (thread_rank == 0) tile_max_n_processed[tile_idx] = n_processed_and_used;
     }
 
