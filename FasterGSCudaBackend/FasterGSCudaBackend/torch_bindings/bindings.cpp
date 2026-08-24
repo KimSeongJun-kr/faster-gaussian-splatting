@@ -18,4 +18,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("update_3d_filter", &filter3d_api::update_3d_filter_wrapper);
     m.def("relocation_adjustment", &densification_api::relocation_wrapper);
     m.def("add_noise", &densification_api::add_noise_wrapper);
+    // Version gate: a (4, N) densification_info silently degrades to plain
+    // gradients on a backend built before absgrad support (row 0/1 offsets
+    // coincide), so callers probe this instead of render-testing.
+    m.def("absgrad_supported", []() { return true; });
 }

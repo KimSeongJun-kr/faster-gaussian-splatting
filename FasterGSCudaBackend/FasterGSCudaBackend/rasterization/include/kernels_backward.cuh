@@ -31,6 +31,7 @@ namespace faster_gs::rasterization::kernels::backward {
         float3* __restrict__ grad_sh_coefficients_0,
         float3* __restrict__ grad_sh_coefficients_rest,
         float* __restrict__ densification_info,
+        const int densification_rows,
         float* __restrict__ grad_w2c,
         const uint n_primitives,
         const uint active_sh_bases,
@@ -195,9 +196,24 @@ namespace faster_gs::rasterization::kernels::backward {
         // for adaptive density control
         if (densification_info != nullptr) {
             densification_info[primitive_idx] += 1.0f;
+            float2 g = dL_dmean2d;  // plain: cancelled sum over pixels
+            if (densification_rows >= 4) {
+                // absgrad: component-wise |grad| sums written by blend_backward_cu
+                // into rows 2/3 (norm taken here, once, after the global sum —
+                // matches gsplat's ‖(Σ|dx|, Σ|dy|)‖ convention).
+                g = make_float2(densification_info[2 * n_primitives + primitive_idx],
+                                densification_info[3 * n_primitives + primitive_idx]);
+                // zero-after-read: rows 2/3 are per-backward scratch. Every
+                // primitive blend wrote has n_touched_tiles > 0, so this kernel
+                // is guaranteed to visit it — clearing here keeps callers that
+                // reuse one info tensor across backwards from inflating row 1
+                // with norms of running sums.
+                densification_info[2 * n_primitives + primitive_idx] = 0.0f;
+                densification_info[3 * n_primitives + primitive_idx] = 0.0f;
+            }
             const float2 dL_dmean2d_ndc = 0.5f * make_float2(
-                dL_dmean2d.x * width,
-                dL_dmean2d.y * height
+                g.x * width,
+                g.y * height
             );
             densification_info[n_primitives + primitive_idx] += length(dL_dmean2d_ndc);
         }
@@ -307,6 +323,8 @@ namespace faster_gs::rasterization::kernels::backward {
         float* __restrict__ grad_conic,
         float* __restrict__ grad_opacity,
         float3* __restrict__ grad_sh_coefficients_0,
+        float* __restrict__ densification_info,
+        const int densification_rows,
         const uint n_primitives,
         const uint width,
         const uint height,
@@ -357,6 +375,11 @@ namespace faster_gs::rasterization::kernels::backward {
 
         // gradient accumulation
         float2 dL_dmean2d_accum = {0.0f, 0.0f};
+        // absgrad (AbsGS): per-pixel |dL/dmean2d| accumulated component-wise, so
+        // opposing-sign contributions within a view cannot cancel. Lane owns the
+        // primitive here, so this register already holds the bucket-local sum —
+        // no warp reduction needed (unlike gsplat's pixel-per-thread layout).
+        float2 dL_dmean2d_abs_accum = {0.0f, 0.0f};
         float3 dL_dconic_accum = {0.0f, 0.0f, 0.0f};
         float dL_dopacity_accum = 0.0f;
         float3 dL_dcolor_accum = {0.0f, 0.0f, 0.0f};
@@ -505,6 +528,9 @@ namespace faster_gs::rasterization::kernels::backward {
                 conic.y * delta.x + conic.z * delta.y
             );
             dL_dmean2d_accum += dL_dmean2d;
+            if (densification_rows >= 4) {
+                dL_dmean2d_abs_accum += make_float2(fabsf(dL_dmean2d.x), fabsf(dL_dmean2d.y));
+            }
 
             transmittance *= one_minus_alpha;
         }
@@ -513,6 +539,10 @@ namespace faster_gs::rasterization::kernels::backward {
         if (valid_primitive) {
             atomicAdd(&grad_mean2d[primitive_idx].x, dL_dmean2d_accum.x);
             atomicAdd(&grad_mean2d[primitive_idx].y, dL_dmean2d_accum.y);
+            if (densification_rows >= 4) {
+                atomicAdd(&densification_info[2 * n_primitives + primitive_idx], dL_dmean2d_abs_accum.x);
+                atomicAdd(&densification_info[3 * n_primitives + primitive_idx], dL_dmean2d_abs_accum.y);
+            }
             atomicAdd(&grad_conic[primitive_idx], dL_dconic_accum.x);
             atomicAdd(&grad_conic[n_primitives + primitive_idx], dL_dconic_accum.y);
             atomicAdd(&grad_conic[2 * n_primitives + primitive_idx], dL_dconic_accum.z);

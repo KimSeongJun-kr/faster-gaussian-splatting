@@ -145,6 +145,13 @@ faster_gs::rasterization::backward_wrapper(
         : torch::empty({0}, float_options);
 
     const bool update_densification_info = densification_info.size(0) > 0;
+    // Row count doubles as the absgrad flag: (2, N) = plain, (4, N) = absgrad
+    // (rows 2/3 are component-wise |grad| scratch filled by the blend kernel).
+    // Keep the short-circuit order: callers may pass a 1-D empty tensor.
+    const int densification_rows = update_densification_info ? static_cast<int>(densification_info.size(0)) : 0;
+    TORCH_CHECK(!update_densification_info ||
+                (densification_info.is_contiguous() && densification_info.size(1) == n_primitives),
+                "densification_info must be a contiguous (rows, n_primitives) tensor");
 
     backward(
         grad_image.contiguous().data_ptr<float>(),
@@ -173,6 +180,7 @@ faster_gs::rasterization::backward_wrapper(
         reinterpret_cast<float2*>(grad_mean2d_helper.data_ptr<float>()),
         grad_conic_helper.data_ptr<float>(),
         update_densification_info ? densification_info.data_ptr<float>() : nullptr,
+        densification_rows,
         compute_w2c_grad ? grad_w2c.data_ptr<float>() : nullptr,
         n_primitives,
         n_instances,
