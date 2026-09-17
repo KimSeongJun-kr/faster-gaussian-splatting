@@ -24,6 +24,7 @@ namespace faster_gs::rasterization::kernels::backward {
         const uint* __restrict__ primitive_n_touched_tiles,
         const float2* __restrict__ grad_mean2d,
         const float* __restrict__ grad_conic,
+        const float* __restrict__ grad_primitive_depth,
         float3* __restrict__ grad_means,
         float3* __restrict__ grad_scales,
         float4* __restrict__ grad_rotations,
@@ -234,6 +235,16 @@ namespace faster_gs::rasterization::kernels::backward {
         const float factor_y = 1.0f + static_cast<float>(valid_y);
         dL_dmean3d_cam.z += (j11 * (factor_x * x_clipped * dL_dj13 - dL_dj11) + j22 * (factor_y * y_clipped * dL_dj23 - dL_dj22)) / depth;
 
+        // The primitive's rendered depth IS its camera-space z (see `depth` above),
+        // so the blend pass's dL/d(primitive depth) lands here unchanged. Without
+        // this term d(rendered depth)/d(camera-z) is silently zero: the loss still
+        // falls (through alpha) but depth supervision cannot move geometry or pose.
+        // Verified 2026-09-17 against finite differences — see
+        // docs/ablation_study/tools/depth_gradient_gate.py in the dynsplat repo.
+        if (grad_primitive_depth != nullptr) {
+            dL_dmean3d_cam.z += grad_primitive_depth[primitive_idx];
+        }
+
         // camera pose gradient: mean3d_cam = W * mean3d + t with [W | t] = the top three
         // w2c rows, so d/dW[row] = dL_dmean3d_cam[row] * [mean3d, 1]. The covariance
         // path through W and the SH view-direction path are omitted (geometry-only
@@ -321,6 +332,7 @@ namespace faster_gs::rasterization::kernels::backward {
         const float* __restrict__ bucket_depth,
         float2* __restrict__ grad_mean2d,
         float* __restrict__ grad_conic,
+        float* __restrict__ grad_primitive_depth,
         float* __restrict__ grad_opacity,
         float3* __restrict__ grad_sh_coefficients_0,
         float* __restrict__ densification_info,
@@ -382,6 +394,7 @@ namespace faster_gs::rasterization::kernels::backward {
         float2 dL_dmean2d_abs_accum = {0.0f, 0.0f};
         float3 dL_dconic_accum = {0.0f, 0.0f, 0.0f};
         float dL_dopacity_accum = 0.0f;
+        float dL_ddepth_accum = 0.0f;
         float3 dL_dcolor_accum = {0.0f, 0.0f, 0.0f};
 
         // tile metadata
@@ -501,8 +514,14 @@ namespace faster_gs::rasterization::kernels::backward {
             color_pixel_after -= blending_weight * color;
             depth_pixel_after -= blending_weight * depth;
 
-            // TODO: depth gradient w.r.t. the primitive's own depth (means) is intentionally
-            // not backpropagated (same as LichtFeld-Studio PR #278 / gsplat)
+            // depth gradient w.r.t. the primitive's own depth. depth_acc(pixel) =
+            // sum_i T_i * alpha_i * z_i, so d/dz_i is exactly the blending weight.
+            // Upstream (LichtFeld-Studio PR #278 / gsplat) drops this; dropping it
+            // makes d(rendered depth)/d(camera-z) zero, which silently disables
+            // depth-driven geometry and pose optimisation.
+            if (grad_primitive_depth != nullptr) {
+                dL_ddepth_accum += blending_weight * grad_depth_pixel;
+            }
 
             // alpha gradient
             const float one_minus_alpha = 1.0f - alpha;
@@ -542,6 +561,9 @@ namespace faster_gs::rasterization::kernels::backward {
             if (densification_rows >= 4) {
                 atomicAdd(&densification_info[2 * n_primitives + primitive_idx], dL_dmean2d_abs_accum.x);
                 atomicAdd(&densification_info[3 * n_primitives + primitive_idx], dL_dmean2d_abs_accum.y);
+            }
+            if (grad_primitive_depth != nullptr) {
+                atomicAdd(&grad_primitive_depth[primitive_idx], dL_ddepth_accum);
             }
             atomicAdd(&grad_conic[primitive_idx], dL_dconic_accum.x);
             atomicAdd(&grad_conic[n_primitives + primitive_idx], dL_dconic_accum.y);

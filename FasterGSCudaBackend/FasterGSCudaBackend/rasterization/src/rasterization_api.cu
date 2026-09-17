@@ -140,6 +140,8 @@ faster_gs::rasterization::backward_wrapper(
     torch::Tensor grad_sh_coefficients_rest = torch::zeros({n_primitives, total_sh_bases, 3}, float_options);
     torch::Tensor grad_mean2d_helper = torch::zeros({n_primitives, 2}, float_options);
     torch::Tensor grad_conic_helper = torch::zeros({3, n_primitives}, float_options);
+    // dL/d(primitive camera-z) from the blend pass, consumed by preprocess_backward.
+    torch::Tensor grad_depth_helper = torch::zeros({n_primitives}, float_options);
     torch::Tensor grad_w2c = compute_w2c_grad
         ? torch::zeros({4, 4}, float_options)
         : torch::empty({0}, float_options);
@@ -179,6 +181,7 @@ faster_gs::rasterization::backward_wrapper(
         reinterpret_cast<float3*>(grad_sh_coefficients_rest.data_ptr<float>()),
         reinterpret_cast<float2*>(grad_mean2d_helper.data_ptr<float>()),
         grad_conic_helper.data_ptr<float>(),
+        grad_depth_helper.data_ptr<float>(),
         update_densification_info ? densification_info.data_ptr<float>() : nullptr,
         densification_rows,
         compute_w2c_grad ? grad_w2c.data_ptr<float>() : nullptr,

@@ -31,6 +31,7 @@ namespace faster_gs::rasterization {
         float3* grad_sh_coefficients_rest,
         float2* grad_mean2d_helper,
         float* grad_conic_helper,
+        float* grad_depth_helper,
         float* densification_info,
         const int densification_rows,
         float* grad_w2c,
