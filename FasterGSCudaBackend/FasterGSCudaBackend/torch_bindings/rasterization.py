@@ -51,6 +51,8 @@ class _Rasterize(torch.autograd.Function):
         densification_info: torch.Tensor,
         w2c: torch.Tensor,
         rasterizer_settings: RasterizerSettings,
+        color_gate: Optional[torch.Tensor],
+        color_gated: Optional[torch.Tensor],
     ) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor]':
         (
             image, alpha, depth,
@@ -86,6 +88,10 @@ class _Rasterize(torch.autograd.Function):
         )
         ctx.densification_info = densification_info
         ctx.mark_non_differentiable(densification_info)
+        # Constants of the backward pass (never differentiated): keep the
+        # references on ctx rather than in saved_tensors.
+        ctx.color_gate = color_gate
+        ctx.color_gated = color_gated
         return image, alpha, depth
 
     @staticmethod
@@ -95,7 +101,7 @@ class _Rasterize(torch.autograd.Function):
         grad_image: torch.Tensor,
         grad_alpha: torch.Tensor,
         grad_depth: torch.Tensor,
-    ) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None, Optional[torch.Tensor], None]':
+    ) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None, Optional[torch.Tensor], None, None, None]':
         # materialize_grads is enabled by default, so unused outputs arrive as
         # zero-filled tensors; the None guards are purely defensive.
         if grad_alpha is None:
@@ -104,6 +110,9 @@ class _Rasterize(torch.autograd.Function):
             grad_depth = torch.zeros_like(grad_image[:1])
         *saved, w2c = ctx.saved_tensors
         compute_w2c_grad = ctx.needs_input_grad[7]
+        empty = grad_image.new_empty(0)
+        color_gate = ctx.color_gate if ctx.color_gate is not None else empty
+        color_gated = ctx.color_gated if ctx.color_gated is not None else empty.to(torch.uint8)
         (
             grad_means, grad_scales, grad_rotations, grad_opacities,
             grad_sh_coefficients_0, grad_sh_coefficients_rest, grad_w2c
@@ -119,6 +128,8 @@ class _Rasterize(torch.autograd.Function):
             *ctx.rasterizer_settings.as_tuple()[1:],
             *ctx.buffer_state,
             compute_w2c_grad,
+            color_gate,
+            color_gated,
         )
         return (
             grad_means,
@@ -130,6 +141,8 @@ class _Rasterize(torch.autograd.Function):
             None,  # densification_info
             grad_w2c if compute_w2c_grad else None,
             None,  # rasterizer_settings
+            None,  # color_gate
+            None,  # color_gated
         )
 
 
@@ -143,6 +156,8 @@ def diff_rasterize(
     densification_info: torch.Tensor,
     rasterizer_settings: RasterizerSettings,
     w2c: Optional[torch.Tensor] = None,
+    color_gate: Optional[torch.Tensor] = None,
+    color_gated: Optional[torch.Tensor] = None,
 ) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor]':
     """Returns (image (3,H,W), alpha (1,H,W), accumulated depth (1,H,W)).
 
@@ -154,7 +169,18 @@ def diff_rasterize(
     returned gradient covers the geometric path only (mean projection incl.
     the Jacobian-through-depth term) — covariance-through-W and SH
     view-direction contributions are omitted.
+
+    `color_gate` ((H,W) float in [0,1]) with `color_gated` ((N,) uint8, 1 =
+    obeys the gate) scales the colour gradient (sh0 and sh_rest) that each
+    flagged primitive receives from each pixel. Every other gradient path
+    (opacity, mean, scale, rotation, depth, w2c) is untouched. Both None =
+    no gate (the backward is bit-for-bit the ungated kernel path).
     """
+    if (color_gate is None) != (color_gated is None):
+        raise ValueError("color_gate and color_gated must be given together")
+    if color_gate is not None:
+        color_gate = color_gate.reshape(-1).contiguous().float()
+        color_gated = color_gated.reshape(-1).contiguous().to(torch.uint8)
     if w2c is None:
         w2c = rasterizer_settings.w2c
     return _Rasterize.apply(
@@ -167,6 +193,8 @@ def diff_rasterize(
         densification_info,
         w2c.contiguous(),
         rasterizer_settings,
+        color_gate,
+        color_gated,
     )
 
 

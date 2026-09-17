@@ -127,7 +127,9 @@ faster_gs::rasterization::backward_wrapper(
     const int n_instances,
     const int n_buckets,
     const int instance_primitive_indices_selector,
-    const bool compute_w2c_grad)
+    const bool compute_w2c_grad,
+    const torch::Tensor& color_gate,
+    const torch::Tensor& color_gated)
 {
     const int n_primitives = means.size(0);
     const int total_sh_bases = sh_coefficients_rest.size(1);
@@ -155,10 +157,28 @@ faster_gs::rasterization::backward_wrapper(
                 (densification_info.is_contiguous() && densification_info.size(1) == n_primitives),
                 "densification_info must be a contiguous (rows, n_primitives) tensor");
 
+    // Colour-gradient gate: both tensors empty = off. Otherwise a (H*W) float
+    // pixel factor and a (n_primitives) uint8 per-primitive flag, both CUDA and
+    // contiguous (the wrapper does not copy: mismatched shapes would silently
+    // index garbage in the blend kernel, so they are checked here).
+    const bool use_color_gate = color_gate.numel() > 0 || color_gated.numel() > 0;
+    TORCH_CHECK(!use_color_gate ||
+                (color_gate.is_cuda() && color_gate.is_contiguous() &&
+                 color_gate.scalar_type() == torch::kFloat &&
+                 color_gate.numel() == static_cast<int64_t>(width) * height),
+                "color_gate must be a contiguous CUDA float tensor with width*height elements");
+    TORCH_CHECK(!use_color_gate ||
+                (color_gated.is_cuda() && color_gated.is_contiguous() &&
+                 color_gated.scalar_type() == torch::kUInt8 &&
+                 color_gated.numel() == n_primitives),
+                "color_gated must be a contiguous CUDA uint8 tensor with n_primitives elements");
+
     backward(
         grad_image.contiguous().data_ptr<float>(),
         grad_alpha.contiguous().data_ptr<float>(),
         grad_depth.contiguous().data_ptr<float>(),
+        use_color_gate ? color_gate.data_ptr<float>() : nullptr,
+        use_color_gate ? color_gated.data_ptr<unsigned char>() : nullptr,
         image.data_ptr<float>(),
         depth.data_ptr<float>(),
         reinterpret_cast<float3*>(means.data_ptr<float>()),

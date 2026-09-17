@@ -322,6 +322,14 @@ namespace faster_gs::rasterization::kernels::backward {
         const float* __restrict__ grad_image,
         const float* __restrict__ grad_alpha_map,
         const float* __restrict__ grad_depth_map,
+        // Colour-gradient gate (dynsplat, 2026-09-17): per-pixel factor in
+        // [0,1] applied to dL/dcolor of every primitive flagged in
+        // `color_gated` (1 = obeys the gate). nullptr = no gate. Only the
+        // colour path is touched: alpha/opacity/mean/conic/depth gradients
+        // still see the full pixel gradient, so a gated primitive keeps
+        // moving/fading under object pixels — it just cannot repaint for them.
+        const float* __restrict__ color_gate,
+        const unsigned char* __restrict__ color_gated,
         const float* __restrict__ image,
         const float* __restrict__ depth_map,
         const float* __restrict__ tile_final_transmittances,
@@ -367,6 +375,7 @@ namespace faster_gs::rasterization::kernels::backward {
         float3 color = {0.0f, 0.0f, 0.0f};
         float3 color_grad_factor = {0.0f, 0.0f, 0.0f};
         float depth = 0.0f;
+        bool gated = false;
         if (valid_primitive) {
             primitive_idx = instance_primitive_indices[instance_idx];
             mean2d = primitive_mean2d[primitive_idx];
@@ -379,6 +388,7 @@ namespace faster_gs::rasterization::kernels::backward {
             if (color_unclamped.y >= 0.0f) color_grad_factor.y = 1.0f;
             if (color_unclamped.z >= 0.0f) color_grad_factor.z = 1.0f;
             depth = primitive_depth[primitive_idx];
+            gated = color_gated != nullptr && color_gated[primitive_idx] != 0;
         }
 
         // helpers
@@ -408,6 +418,7 @@ namespace faster_gs::rasterization::kernels::backward {
         float grad_alpha_common;
         float depth_pixel_after;
         float grad_depth_pixel;
+        float color_gate_pixel;
 
         bucket_color_transmittance += bucket_idx * config::block_size_blend;
         bucket_depth += bucket_idx * config::block_size_blend;
@@ -416,6 +427,7 @@ namespace faster_gs::rasterization::kernels::backward {
         __shared__ float4 collected_grad_info_pixel[32];
         __shared__ float collected_depth_pixel_after[32];
         __shared__ float collected_grad_depth_pixel[32];
+        __shared__ float collected_color_gate[32];
 
         // iterate over all pixels in the tile
         #pragma unroll
@@ -430,6 +442,7 @@ namespace faster_gs::rasterization::kernels::backward {
                     // final values from forward pass before background blend and the respective gradients
                     float3 color_pixel_w_bg, grad_color_pixel;
                     float grad_alpha_pixel = 0.0f, depth_pixel = 0.0f, grad_depth_pixel_tmp = 0.0f;
+                    float color_gate_tmp = 1.0f;
                     if (pixel_coords.x < width && pixel_coords.y < height) {
                         color_pixel_w_bg = make_float3(
                             image[pixel_idx],
@@ -444,6 +457,7 @@ namespace faster_gs::rasterization::kernels::backward {
                         grad_alpha_pixel = grad_alpha_map[pixel_idx];
                         depth_pixel = depth_map[pixel_idx];
                         grad_depth_pixel_tmp = grad_depth_map[pixel_idx];
+                        if (color_gate != nullptr) color_gate_tmp = color_gate[pixel_idx];
                     }
                     const float final_transmittance = tile_final_transmittances[pixel_idx];
                     collected_color_pixel_after_transmittance[lane_idx] = make_float4(
@@ -457,6 +471,7 @@ namespace faster_gs::rasterization::kernels::backward {
                     collected_last_contributor[lane_idx] = tile_n_processed[pixel_idx];
                     collected_depth_pixel_after[lane_idx] = depth_pixel - start_depth;
                     collected_grad_depth_pixel[lane_idx] = grad_depth_pixel_tmp;
+                    collected_color_gate[lane_idx] = color_gate_tmp;
                 }
                 warp.sync();
             }
@@ -473,6 +488,7 @@ namespace faster_gs::rasterization::kernels::backward {
                 grad_alpha_common = warp.shfl_up(grad_alpha_common, 1);
                 depth_pixel_after = warp.shfl_up(depth_pixel_after, 1);
                 grad_depth_pixel = warp.shfl_up(grad_depth_pixel, 1);
+                color_gate_pixel = warp.shfl_up(color_gate_pixel, 1);
             }
 
             // which pixel index should this thread deal with?
@@ -492,6 +508,7 @@ namespace faster_gs::rasterization::kernels::backward {
                 grad_alpha_common = grad_info_pixel.w;
                 depth_pixel_after = collected_depth_pixel_after[current_shmem_index];
                 grad_depth_pixel = collected_grad_depth_pixel[current_shmem_index];
+                color_gate_pixel = collected_color_gate[current_shmem_index];
             }
 
             const bool skip = !valid_primitive || !valid_pixel || idx < 0 || idx >= config::block_size_blend || tile_primitive_idx >= last_contributor;
@@ -508,7 +525,8 @@ namespace faster_gs::rasterization::kernels::backward {
             const float blending_weight = transmittance * alpha;
 
             // color gradient
-            const float3 dL_dcolor = blending_weight * grad_color_pixel * color_grad_factor;
+            const float3 dL_dcolor = blending_weight * grad_color_pixel * color_grad_factor
+                                     * (gated ? color_gate_pixel : 1.0f);
             dL_dcolor_accum += dL_dcolor;
 
             color_pixel_after -= blending_weight * color;

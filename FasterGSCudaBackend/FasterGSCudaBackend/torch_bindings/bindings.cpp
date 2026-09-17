@@ -22,4 +22,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     // gradients on a backend built before absgrad support (row 0/1 offsets
     // coincide), so callers probe this instead of render-testing.
     m.def("absgrad_supported", []() { return true; });
+    // Same idea for the per-pixel colour-gradient gate (backward's trailing
+    // color_gate/color_gated tensors): an older backend would reject the
+    // extra positional arguments at call time, so callers probe this first.
+    m.def("color_gate_supported", []() { return true; });
 }

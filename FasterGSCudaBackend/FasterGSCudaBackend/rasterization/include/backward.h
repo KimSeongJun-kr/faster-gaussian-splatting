@@ -9,6 +9,8 @@ namespace faster_gs::rasterization {
         const float* grad_image,
         const float* grad_alpha,
         const float* grad_depth,
+        const float* color_gate,
+        const unsigned char* color_gated,
         const float* image,
         const float* depth,
         const float3* means,

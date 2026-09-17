@@ -60,7 +60,9 @@ namespace faster_gs::rasterization {
         const int n_instances,
         const int n_buckets,
         const int instance_primitive_indices_selector,
-        const bool compute_w2c_grad);
+        const bool compute_w2c_grad,
+        const torch::Tensor& color_gate,
+        const torch::Tensor& color_gated);
 
     torch::Tensor
     inference_wrapper(
