@@ -25,6 +25,7 @@ std::tuple<int, int, int> faster_gs::rasterization::forward(
     float* image,
     float* alpha,
     float* depth,
+    float* surface_depth,
     const int n_primitives,
     const int active_sh_bases,
     const int total_sh_bases,
@@ -145,6 +146,7 @@ std::tuple<int, int, int> faster_gs::rasterization::forward(
         image, \
         alpha, \
         depth, \
+        surface_depth, \
         memset_stream, \
         n_visible_primitives, \
         n_instances, \
@@ -173,6 +175,7 @@ void faster_gs::rasterization::diff_rasterize(
     float* image,
     float* alpha,
     float* depth,
+    float* surface_depth,
     const cudaStream_t memset_stream,
     const int n_visible_primitives,
     const int n_instances,
@@ -267,6 +270,7 @@ void faster_gs::rasterization::diff_rasterize(
         image,
         alpha,
         depth,
+        surface_depth,
         tile_buffers.final_transmittances,
         tile_buffers.max_n_processed,
         tile_buffers.n_processed,

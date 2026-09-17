@@ -51,9 +51,9 @@ class _Rasterize(torch.autograd.Function):
         densification_info: torch.Tensor,
         w2c: torch.Tensor,
         rasterizer_settings: RasterizerSettings,
-    ) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor]':
+    ) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]':
         (
-            image, alpha, depth,
+            image, alpha, depth, surface_depth,
             primitive_buffers, tile_buffers, instance_buffers, bucket_buffers,
             n_instances, n_buckets, instance_primitive_indices_selector
         ) = _C.forward(
@@ -86,7 +86,11 @@ class _Rasterize(torch.autograd.Function):
         )
         ctx.densification_info = densification_info
         ctx.mark_non_differentiable(densification_info)
-        return image, alpha, depth
+        # Surface depth carries no gradient yet (forward only): it exists to let a
+        # metric see the FIRST surface instead of the alpha-weighted mean. Marking
+        # it explicitly keeps autograd from silently expecting a grad slot for it.
+        ctx.mark_non_differentiable(surface_depth)
+        return image, alpha, depth, surface_depth
 
     @staticmethod
     @once_differentiable
@@ -95,6 +99,7 @@ class _Rasterize(torch.autograd.Function):
         grad_image: torch.Tensor,
         grad_alpha: torch.Tensor,
         grad_depth: torch.Tensor,
+        grad_surface_depth: torch.Tensor = None,   # forward-only output
     ) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, None, Optional[torch.Tensor], None]':
         # materialize_grads is enabled by default, so unused outputs arrive as
         # zero-filled tensors; the None guards are purely defensive.
@@ -143,11 +148,18 @@ def diff_rasterize(
     densification_info: torch.Tensor,
     rasterizer_settings: RasterizerSettings,
     w2c: Optional[torch.Tensor] = None,
-) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor]':
-    """Returns (image (3,H,W), alpha (1,H,W), accumulated depth (1,H,W)).
+) -> 'tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]':
+    """Returns (image, alpha, accumulated depth, surface depth) — each (.,H,W).
 
     The depth map is alpha-weighted accumulated depth; divide by alpha
-    (clamped) to obtain the expected depth.
+    (clamped) to obtain the expected depth — a MEAN along the ray, pulled far by
+    anything behind the first surface.
+
+    The surface depth is the z at which accumulated transmittance first drops
+    below 0.5, i.e. the first opaque surface. It is FORWARD ONLY (no gradient).
+    On grazing geometry the two diverge badly: one flat Gaussian spanning
+    5--40 m of road reports its centre as the mean, measured x8.25 too far at
+    5 m on scene-0796 (2026-09-17).
 
     Pass `w2c` to make the view matrix a differentiable input (camera pose
     gradients); it takes precedence over `rasterizer_settings.w2c`. The

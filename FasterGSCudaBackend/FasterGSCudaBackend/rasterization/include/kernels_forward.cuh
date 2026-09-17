@@ -375,6 +375,12 @@ namespace faster_gs::rasterization::kernels::forward {
         float* __restrict__ image,
         float* __restrict__ alpha_map,
         float* __restrict__ depth_map,
+        // Surface depth: the z where accumulated transmittance first drops below
+        // 0.5. depth_map is the alpha-weighted MEAN along the ray and is pulled
+        // far by anything behind the first surface; on grazing geometry (road)
+        // one flat Gaussian spans 5-40 m and reports its CENTRE, which measured
+        // x8.25 too far at 5 m on scene-0796 (2026-09-17). nullptr = not wanted.
+        float* __restrict__ surface_depth_map,
         float* __restrict__ tile_final_transmittances,
         uint* __restrict__ tile_max_n_processed,
         uint* __restrict__ tile_n_processed,
@@ -410,6 +416,7 @@ namespace faster_gs::rasterization::kernels::forward {
         // initialize local storage
         float3 color_pixel = make_float3(0.0f);
         float depth_pixel = 0.0f;
+        float surface_depth_pixel = -1.0f;   // < 0 = transmittance never crossed 0.5
         float transmittance = 1.0f;
         uint n_processed = 0;
         uint n_processed_and_used = 0;
@@ -455,6 +462,12 @@ namespace faster_gs::rasterization::kernels::forward {
                 color_pixel += blending_weight * collected_color[j];
                 depth_pixel += blending_weight * collected_depth[j];
 
+                // surface depth: the fragment that takes accumulated transmittance
+                // through 0.5. Recorded BEFORE the update so it is this Gaussian's z.
+                if (surface_depth_pixel < 0.0f && transmittance * (1.0f - alpha) < 0.5f) {
+                    surface_depth_pixel = collected_depth[j];
+                }
+
                 // update transmittance
                 transmittance *= 1.0f - alpha;
 
@@ -480,6 +493,12 @@ namespace faster_gs::rasterization::kernels::forward {
             tile_final_transmittances[pixel_idx] = transmittance;
             alpha_map[pixel_idx] = 1.0f - transmittance;
             depth_map[pixel_idx] = depth_pixel;
+            if (surface_depth_map != nullptr) {
+                // never crossed 0.5 (thin / empty ray) -> fall back to the mean, so
+                // a consumer never sees a sentinel it has to special-case
+                surface_depth_map[pixel_idx] =
+                    (surface_depth_pixel < 0.0f) ? depth_pixel : surface_depth_pixel;
+            }
             tile_n_processed[pixel_idx] = n_processed_and_used;
         }
         // max reduce the number of processed Gaussians per tile
