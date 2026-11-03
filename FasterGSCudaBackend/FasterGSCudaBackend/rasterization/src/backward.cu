@@ -32,8 +32,8 @@ void faster_gs::rasterization::backward(
     float2* grad_mean2d_helper,
     float* grad_conic_helper,
     float* grad_depth_helper,
+    float2* grad_mean2d_abs_helper,
     float* densification_info,
-    const int densification_rows,
     float* grad_w2c,
     const int n_primitives,
     const int n_instances,
@@ -68,7 +68,8 @@ void faster_gs::rasterization::backward(
 
     // note that with c++20 one could use a templated lambda to improve readability here
     auto dispatch_rasterize_backward = [&](const uint* instance_primitive_indices) {
-        kernels::backward::blend_backward_cu<<<n_buckets, 32>>>(
+        const auto blend_backward_kernel = grad_mean2d_abs_helper != nullptr ? kernels::backward::blend_backward_cu<true> : kernels::backward::blend_backward_cu<false>;
+        blend_backward_kernel<<<n_buckets, 32>>>(
             tile_buffers.instance_ranges,
             tile_buffers.buckets_offset,
             instance_primitive_indices,
@@ -93,8 +94,7 @@ void faster_gs::rasterization::backward(
             grad_depth_helper,
             grad_opacities,
             grad_sh_coefficients_0,
-            densification_info,
-            densification_rows,
+            grad_mean2d_abs_helper,
             n_primitives,
             width,
             height,
@@ -114,7 +114,7 @@ void faster_gs::rasterization::backward(
         dispatch_rasterize_backward(instance_buffers.primitive_indices.Current());
     }
 
-    kernels::backward::preprocess_backward_cu<<<div_round_up(n_primitives, config::block_size_preprocess_backward), config::block_size_preprocess_backward>>>(
+    kernels::backward::preprocess_backward_cu<<<div_round_up(n_primitives, config::block_size_preprocess_backward), config::block_size_preprocess_backward, config::block_size_preprocess_backward * total_sh_bases * sizeof(float3)>>>(
         means,
         scales,
         rotations,
@@ -125,6 +125,7 @@ void faster_gs::rasterization::backward(
         primitive_buffers.n_touched_tiles,
         grad_mean2d_helper,
         grad_conic_helper,
+        grad_mean2d_abs_helper,
         grad_depth_helper,
         grad_means,
         grad_scales,
@@ -133,7 +134,6 @@ void faster_gs::rasterization::backward(
         grad_sh_coefficients_0,
         grad_sh_coefficients_rest,
         densification_info,
-        densification_rows,
         grad_w2c,
         n_primitives,
         active_sh_bases,

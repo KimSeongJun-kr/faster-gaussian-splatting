@@ -13,6 +13,7 @@ from Datasets.utils import BasicPointCloud
 from Logging import Logger
 from Methods.Base.Model import BaseModel
 from Cameras.utils import quaternion_to_rotation_matrix
+from Methods.FasterGS.utils import rgb_to_sh0
 from Methods.FasterGS.FasterGSCudaBackend import FusedAdam, update_3d_filter, relocation_adjustment, add_noise
 from Optim.adam_utils import replace_param_group_data, prune_param_groups, extend_param_groups, sort_param_groups, reset_state
 from Optim.lr_utils import LRDecayPolicy
@@ -121,7 +122,7 @@ class Gaussians(torch.nn.Module):
 
     @property
     def densification_info(self) -> torch.Tensor:
-        """Returns the current densification info buffers (2, N)."""
+        """Returns the current densification info buffers (2 or 3, N): [visibility count, grad, (absgrad)]."""
         return self._densification_info
 
     @property
@@ -157,9 +158,9 @@ class Gaussians(torch.nn.Module):
         max_focal = 1e-12
         for view in dataset:
             if not isinstance(view.camera, PerspectiveCamera):
-                raise Framework.ModelError('update3dfilter only supports perspective cameras')
+                raise Framework.ModelError('3d filter only supports perspective cameras')
             if view.camera.distortion is not None:
-                Logger.log_warning('update3dfilter ignores all distortion parameters')
+                Logger.log_warning('3d filter ignores all distortion parameters')
             max_focal = max(max_focal, max(view.camera.focal_x, view.camera.focal_y))
         # assume max_focal is focal length of the highest resolution camera
         self.distance2filter = math.sqrt(filter_config.FILTER_VARIANCE) / max_focal
@@ -172,9 +173,9 @@ class Gaussians(torch.nn.Module):
         visibility_mask = torch.zeros((positions.shape[0], 1), device=positions.device, dtype=torch.bool)
         for view in dataset:
             if not isinstance(view.camera, PerspectiveCamera):
-                raise Framework.ModelError('update3dfilter only supports perspective cameras')
+                raise Framework.ModelError('3d filter only supports perspective cameras')
             if view.camera.distortion is not None:
-                Logger.log_warning('update3dfilter ignores all distortion parameters')
+                Logger.log_warning('3d filter ignores all distortion parameters')
             update_3d_filter(
                 positions,
                 view.w2c,
@@ -187,6 +188,7 @@ class Gaussians(torch.nn.Module):
                 view.camera.center_x,
                 view.camera.center_y,
                 view.camera.near_plane,
+                view.camera.far_plane,
                 clipping_tolerance,
                 self.distance2filter,
             )
@@ -205,8 +207,10 @@ class Gaussians(torch.nn.Module):
         n_initial_gaussians = means.shape[0]
         Logger.log_info(f'number of Gaussians at initialization: {n_initial_gaussians:,}')
         # initial sh coefficients
-        rgbs = torch.full_like(means, fill_value=0.5) if point_cloud.colors is None else point_cloud.colors.cuda()
-        sh_coefficients_0 = ((rgbs - 0.5) / 0.28209479177387814)[:, None, :]
+        if point_cloud.colors is None:
+            sh_coefficients_0 = torch.full((n_initial_gaussians, 1, 3), fill_value=rgb_to_sh0(0.5), dtype=torch.float32, device='cuda')
+        else:
+            sh_coefficients_0 = rgb_to_sh0(point_cloud.colors.cuda()[:, None, :])
         sh_coefficients_rest = torch.zeros((n_initial_gaussians, (self.max_sh_degree + 1) ** 2 - 1, 3), dtype=torch.float32, device='cuda')
         # initial scales
         distances = compute_root_mean_squared_knn_distances(means)
@@ -302,12 +306,22 @@ class Gaussians(torch.nn.Module):
         if self._filter_3d is not None:
             self._filter_3d = self._filter_3d[ordering].contiguous()
 
-    def reset_densification_info(self):
-        self._densification_info = torch.zeros((2, self._means.shape[0]), dtype=torch.float32, device='cuda')
+    def reset_densification_info(self, use_abs_grad: bool) -> None:
+        """Resets the densification info buffers to zero."""
+        n_rows = 3 if use_abs_grad else 2
+        self._densification_info = torch.zeros((n_rows, self._means.shape[0]), dtype=torch.float32, device='cuda')
 
     def adaptive_density_control(self, grad_threshold: float, min_opacity: float, prune_large_gaussians: bool) -> None:
         """Densify Gaussians and prune those that are not visible or too large."""
-        densification_mask = self.densification_info[1] >= grad_threshold * self.densification_info[0].clamp_min(1.0)
+        denominator = self.densification_info[0].clamp_min(1.0)
+        densification_mask = self.densification_info[1] >= grad_threshold * denominator
+        if self.densification_info.shape[0] == 3:
+            # absolute gradient densification from AbsGS using the selection strategy of Gaussian Opacity Fields
+            n_selected = densification_mask.sum().item()
+            if n_selected > 0:
+                grads_abs = self.densification_info[2] / denominator
+                abs_grad_threshold = grads_abs.kthvalue(grads_abs.shape[0] - n_selected + 1).values
+                densification_mask |= grads_abs >= abs_grad_threshold
         is_small = torch.max(self._scales, dim=1).values <= math.log(self.percent_dense * self.training_cameras_extent)
 
         # duplicate small gaussians
@@ -364,7 +378,7 @@ class Gaussians(torch.nn.Module):
     def mcmc_densification(self, min_opacity: float, cap_max: int) -> None:
         """Relocates low-opacity/degenerate Gaussians and adds new ones up to a cap."""
         # relocate
-        dead_mask = self._opacities.flatten() <= math.log(min_opacity / (1 - min_opacity))
+        dead_mask = self.raw_opacities.flatten() <= math.log(min_opacity / (1 - min_opacity))
         dead_mask |= self._rotations.mul(self._rotations).sum(dim=1) < 1e-8
         n_dead_gaussians = dead_mask.sum().item()
         if n_dead_gaussians > 0:
@@ -380,9 +394,16 @@ class Gaussians(torch.nn.Module):
             counts = counts_per_unique[inverse] + 1  # +1 for the original Gaussian
             adjusted_opacities, adjusted_scales = relocation_adjustment(
                 opacities[sampled_indices],
-                self._scales[sampled_indices].exp(),
+                self.raw_scales[sampled_indices].exp(),
                 counts,
             )
+            if self.use_original_3d_filter:
+                filter_3d = self._filter_3d[sampled_indices]
+                adjusted_scales_square = adjusted_scales.square() - filter_3d
+                adjusted_scales_square = torch.where(adjusted_scales_square > 0, adjusted_scales_square, self._scales[sampled_indices].exp().square())
+                adjusted_opacities = adjusted_opacities / (adjusted_scales_square / (adjusted_scales_square + filter_3d)).prod(dim=1).sqrt()[:, None]
+                adjusted_scales = adjusted_scales_square.sqrt()
+                self._filter_3d[dead_indices] = filter_3d  # required for adding new Gaussians below
             adjusted_opacities = adjusted_opacities.clamp(min_opacity, 1.0 - torch.finfo(torch.float32).eps).logit()
             adjusted_scales = adjusted_scales.log()
 
@@ -401,9 +422,8 @@ class Gaussians(torch.nn.Module):
             # reset optimizer state for the sampled Gaussians
             reset_state(self.optimizer, indices=sampled_indices)
 
-            # if they were set, densification info and 3d filter are now no longer valid
+            # if it was set, densification info is now no longer valid
             self._densification_info = None
-            self._filter_3d = None
 
         # add new Gaussians
         current_n_points = self._means.shape[0]
@@ -419,9 +439,15 @@ class Gaussians(torch.nn.Module):
             counts = counts_per_unique[inverse] + 1  # +1 for the original Gaussian
             adjusted_opacities, adjusted_scales = relocation_adjustment(
                 opacities[sampled_indices],
-                self._scales[sampled_indices].exp(),
+                self.raw_scales[sampled_indices].exp(),
                 counts,
             )
+            if self.use_original_3d_filter:
+                filter_3d = self._filter_3d[sampled_indices]
+                adjusted_scales_square = adjusted_scales.square() - filter_3d
+                adjusted_scales_square = torch.where(adjusted_scales_square > 0, adjusted_scales_square, self._scales[sampled_indices].exp().square())
+                adjusted_opacities = adjusted_opacities / (adjusted_scales_square / (adjusted_scales_square + filter_3d)).prod(dim=1).sqrt()[:, None]
+                adjusted_scales = adjusted_scales_square.sqrt()
             adjusted_opacities = adjusted_opacities.clamp(min_opacity, 1.0 - torch.finfo(torch.float32).eps).logit()
             adjusted_scales = adjusted_scales.log()
 
@@ -468,10 +494,10 @@ class Gaussians(torch.nn.Module):
     @torch.no_grad()
     def post_optimizer_step(self, inject_noise: bool) -> None:
         """Applies modifications to the Gaussians after every optimizer step."""
-        if inject_noise:
-            add_noise(self.raw_scales, self.raw_rotations, self.raw_opacities, self.means, 5e5 * self.lr_means)
         if self.use_optimized_3d_filter:
             self._scales.clamp_min_(self._filter_3d)
+        if inject_noise:
+            add_noise(self.raw_scales, self.raw_rotations, self.raw_opacities, self._means, 5e5 * self.lr_means)
 
     @torch.no_grad()
     def training_cleanup(self, min_opacity: float) -> int:

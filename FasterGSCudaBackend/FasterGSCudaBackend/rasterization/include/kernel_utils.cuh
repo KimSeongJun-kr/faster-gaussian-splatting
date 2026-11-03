@@ -12,6 +12,12 @@ namespace faster_gs::rasterization::kernels {
         return 1.0f / (1.0f + expf(-x));
     }
 
+    // folds -0.5 and log2(e) into the conic so that blending evaluates the Gaussian with a single exp2
+    __device__ inline float4 scale_conic_for_exp2(const float4& conic_opacity) {
+        constexpr float log2e = 1.44269504089f;
+        return make_float4(-0.5f * log2e * conic_opacity.x, -log2e * conic_opacity.y, -0.5f * log2e * conic_opacity.z, conic_opacity.w);
+    }
+
     __device__ inline mat3x3 convert_quaternion_to_rotation_matrix(
         const float4& quaternion,
         float& norm_sq)
@@ -58,6 +64,15 @@ namespace faster_gs::rasterization::kernels {
         );
     }
 
+    __device__ inline uint4 convert_screen_bounds_to_tile_bounds(const ushort4& screen_bounds) {
+        return make_uint4(
+            screen_bounds.x / config::tile_width,
+            div_round_up<uint>(screen_bounds.y, config::tile_width),
+            screen_bounds.z / config::tile_height,
+            div_round_up<uint>(screen_bounds.w, config::tile_height)
+        );
+    }
+
     // based on https://github.com/r4dl/StopThePop-Rasterization/blob/d8cad09919ff49b11be3d693d1e71fa792f559bb/cuda_rasterizer/stopthepop/stopthepop_common.cuh#L131
     __device__ inline bool will_primitive_contribute(
         const float2& mean,
@@ -70,11 +85,11 @@ namespace faster_gs::rasterization::kernels {
         const float2 rect_max = make_float2(static_cast<float>((tile_x + 1) * config::tile_width - 1), static_cast<float>((tile_y + 1) * config::tile_height - 1));
 
         const float x_min_diff = rect_min.x - mean.x;
-        const float x_left = static_cast<float>(x_min_diff > 0.0f);
+        const float x_left = static_cast<float>(x_min_diff >= 0.0f);
         const float not_in_x_range = x_left + static_cast<float>(mean.x > rect_max.x);
 
         const float y_min_diff = rect_min.y - mean.y;
-        const float y_above = static_cast<float>(y_min_diff > 0.0f);
+        const float y_above = static_cast<float>(y_min_diff >= 0.0f);
         const float not_in_y_range = y_above + static_cast<float>(mean.y > rect_max.y);
 
         // let's hope the compiler optimizes this properly
@@ -108,7 +123,7 @@ namespace faster_gs::rasterization::kernels {
     __device__ inline uint compute_exact_n_touched_tiles(
         const float2& mean2d,
         const float3& conic,
-        const uint4& screen_bounds,
+        const uint4& tile_bounds,
         const float power_threshold,
         const uint tile_count,
         const bool active)
@@ -121,10 +136,10 @@ namespace faster_gs::rasterization::kernels {
         const float2 mean2d_shifted = mean2d - 0.5f;
 
         uint n_touched_tiles = 0;
-        const uint screen_bounds_width = screen_bounds.y - screen_bounds.x;
+        const uint tile_bounds_width = tile_bounds.y - tile_bounds.x;
         for (uint instance_idx = 0; active && instance_idx < tile_count && instance_idx < config::n_sequential_threshold; instance_idx++) {
-            const uint tile_x = screen_bounds.x + (instance_idx % screen_bounds_width);
-            const uint tile_y = screen_bounds.z + (instance_idx / screen_bounds_width);
+            const uint tile_x = tile_bounds.x + (instance_idx % tile_bounds_width);
+            const uint tile_y = tile_bounds.z + (instance_idx / tile_bounds_width);
             if (will_primitive_contribute(mean2d_shifted, conic, tile_x, tile_y, power_threshold)) n_touched_tiles++;
         }
 
@@ -136,11 +151,11 @@ namespace faster_gs::rasterization::kernels {
         for (uint n = 0; n < n_remaining_threads && n < warp_size; n++) {
             const uint current_lane = __fns(remaining_threads, 0, n + 1);
 
-            const uint2 min_screen_bounds_coop = make_uint2(
-                warp.shfl(screen_bounds.x, current_lane),
-                warp.shfl(screen_bounds.z, current_lane)
+            const uint2 min_tile_bounds_coop = make_uint2(
+                warp.shfl(tile_bounds.x, current_lane),
+                warp.shfl(tile_bounds.z, current_lane)
             );
-            const uint screen_bounds_width_coop = warp.shfl(screen_bounds_width, current_lane);
+            const uint tile_bounds_width_coop = warp.shfl(tile_bounds_width, current_lane);
             const uint tile_count_coop = warp.shfl(tile_count, current_lane);
 
             const float2 mean2d_shifted_coop = make_float2(
@@ -158,8 +173,8 @@ namespace faster_gs::rasterization::kernels {
             const uint n_iterations = div_round_up(remaining_tile_count, warp_size);
             for (uint i = 0; i < n_iterations; i++) {
                 const uint instance_idx = i * warp_size + lane_idx + config::n_sequential_threshold;
-                const uint tile_x = min_screen_bounds_coop.x + (instance_idx % screen_bounds_width_coop);
-                const uint tile_y = min_screen_bounds_coop.y + (instance_idx / screen_bounds_width_coop);
+                const uint tile_x = min_tile_bounds_coop.x + (instance_idx % tile_bounds_width_coop);
+                const uint tile_y = min_tile_bounds_coop.y + (instance_idx / tile_bounds_width_coop);
                 const bool contributes = instance_idx < tile_count_coop && will_primitive_contribute(mean2d_shifted_coop, conic_coop, tile_x, tile_y, power_threshold_coop);
                 const uint contributes_ballot = warp.ballot(contributes);
                 const uint n_contributes = __popc(contributes_ballot);

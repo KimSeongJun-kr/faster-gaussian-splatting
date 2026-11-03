@@ -1,6 +1,7 @@
 #pragma once
 
 #include <torch/extension.h>
+#include <optional>
 #include <tuple>
 
 namespace faster_gs::densification {
@@ -16,8 +17,9 @@ namespace faster_gs::densification {
         const torch::Tensor& raw_scales,
         const torch::Tensor& raw_rotations,
         const torch::Tensor& raw_opacities,
-        const torch::Tensor& random_samples,
         torch::Tensor& means,
-        const float current_lr);
+        const float current_lr,
+        const std::optional<torch::Tensor>& noise_scale,
+        const std::optional<torch::Tensor>& random_samples);
 
 }

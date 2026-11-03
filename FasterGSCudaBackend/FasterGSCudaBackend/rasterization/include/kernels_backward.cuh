@@ -24,6 +24,7 @@ namespace faster_gs::rasterization::kernels::backward {
         const uint* __restrict__ primitive_n_touched_tiles,
         const float2* __restrict__ grad_mean2d,
         const float* __restrict__ grad_conic,
+        const float2* __restrict__ grad_mean2d_abs,
         const float* __restrict__ grad_primitive_depth,
         float3* __restrict__ grad_means,
         float3* __restrict__ grad_scales,
@@ -32,7 +33,6 @@ namespace faster_gs::rasterization::kernels::backward {
         float3* __restrict__ grad_sh_coefficients_0,
         float3* __restrict__ grad_sh_coefficients_rest,
         float* __restrict__ densification_info,
-        const int densification_rows,
         float* __restrict__ grad_w2c,
         const uint n_primitives,
         const uint active_sh_bases,
@@ -45,18 +45,50 @@ namespace faster_gs::rasterization::kernels::backward {
         const float center_y,
         const bool proper_antialiasing)
     {
-        const uint primitive_idx = blockIdx.x * blockDim.x + threadIdx.x;
-        if (primitive_idx >= n_primitives || primitive_n_touched_tiles[primitive_idx] == 0) return;
+        constexpr uint warp_size = 32;
+        auto block = cg::this_thread_block();
+        auto warp = cg::tiled_partition<warp_size>(block);
+        const uint thread_idx = cg::this_grid().thread_rank();
+        const uint lane_idx = warp.thread_rank();
+
+        // threads stay alive until the warp-wide sh gradient write below
+        if (thread_idx - lane_idx >= n_primitives) return;
+        const bool valid = thread_idx < n_primitives;
+        const uint primitive_idx = valid ? thread_idx : n_primitives - 1;
+        const bool active = valid && primitive_n_touched_tiles[primitive_idx] > 0;
+
+        // gradients are not zero-initialized
+        if (valid && !active) {
+            grad_means[primitive_idx] = make_float3(0.0f);
+            grad_scales[primitive_idx] = make_float3(0.0f);
+            grad_rotations[primitive_idx] = make_float4(0.0f);
+        }
 
         // load 3d mean
-        const float3 mean3d = means[primitive_idx];
+        const float3 mean3d = active ? means[primitive_idx] : make_float3(0.0f);
 
-        // sh evaluation backward
-        const float3 dL_dmean3d_from_color = convert_sh_to_color_backward(
-            sh_coefficients_rest, grad_sh_coefficients_0, grad_sh_coefficients_rest,
+        // sh evaluation backward, rest coefficient gradients are collected in shared memory for a coalesced write
+        extern __shared__ float3 collected_grad_sh_coefficients_rest[];
+        float3* grad_sh_coefficients_rest_primitive = collected_grad_sh_coefficients_rest + block.thread_rank() * total_sh_bases;
+        const float3 dL_dmean3d_from_color = active ? convert_sh_to_color_backward(
+            sh_coefficients_rest, grad_sh_coefficients_0, grad_sh_coefficients_rest_primitive,
             mean3d, cam_position[0], primitive_idx,
             active_sh_bases, total_sh_bases
-        );
+        ) : make_float3(0.0f);
+        // zero the gradients of inactive bases and invisible primitives
+        for (uint i = active ? active_sh_bases - 1 : 0; i < total_sh_bases; i++) grad_sh_coefficients_rest_primitive[i] = make_float3(0.0f);
+        warp.sync();
+
+        // warp-wide write using 16 byte stores where possible (the warp's first primitive is a multiple of 32)
+        const uint warp_primitive_offset = thread_idx - lane_idx;
+        const uint n_floats_warp = min(warp_size, n_primitives - warp_primitive_offset) * 3 * total_sh_bases;
+        const float* collected_grad_sh_coefficients_rest_warp = reinterpret_cast<const float*>(collected_grad_sh_coefficients_rest + warp.meta_group_rank() * warp_size * total_sh_bases);
+        float* grad_sh_coefficients_rest_warp = reinterpret_cast<float*>(grad_sh_coefficients_rest + warp_primitive_offset * total_sh_bases);
+        const uint n_float4_warp = n_floats_warp / 4;
+        for (uint i = lane_idx; i < n_float4_warp; i += warp_size) reinterpret_cast<float4*>(grad_sh_coefficients_rest_warp)[i] = reinterpret_cast<const float4*>(collected_grad_sh_coefficients_rest_warp)[i];
+        for (uint i = 4 * n_float4_warp + lane_idx; i < n_floats_warp; i += warp_size) grad_sh_coefficients_rest_warp[i] = collected_grad_sh_coefficients_rest_warp[i];
+
+        if (!active) return;
 
         const float4 w2c_r3 = w2c[2];
         const float depth = w2c_r3.x * mean3d.x + w2c_r3.y * mean3d.y + w2c_r3.z * mean3d.z + w2c_r3.w;
@@ -158,7 +190,7 @@ namespace faster_gs::rasterization::kernels::backward {
                 const float dL_dradicand = dL_dopacity_conv_factor * opacity / fmaxf(2.0f * conv_factor, 1e-6f);
                 const float one_minus_radicand = 1.0f - radicand;
                 dL_dcov2d.x += dL_dradicand * (one_minus_radicand * conic.x - kernel_size * determinant_conic);
-                dL_dcov2d.y += dL_dradicand * 2.0f * one_minus_radicand * conic.y;
+                dL_dcov2d.y += dL_dradicand * one_minus_radicand * conic.y;
                 dL_dcov2d.z += dL_dradicand * (one_minus_radicand * conic.z - kernel_size * determinant_conic);
             }
         }
@@ -197,26 +229,19 @@ namespace faster_gs::rasterization::kernels::backward {
         // for adaptive density control
         if (densification_info != nullptr) {
             densification_info[primitive_idx] += 1.0f;
-            float2 g = dL_dmean2d;  // plain: cancelled sum over pixels
-            if (densification_rows >= 4) {
-                // absgrad: component-wise |grad| sums written by blend_backward_cu
-                // into rows 2/3 (norm taken here, once, after the global sum —
-                // matches gsplat's ‖(Σ|dx|, Σ|dy|)‖ convention).
-                g = make_float2(densification_info[2 * n_primitives + primitive_idx],
-                                densification_info[3 * n_primitives + primitive_idx]);
-                // zero-after-read: rows 2/3 are per-backward scratch. Every
-                // primitive blend wrote has n_touched_tiles > 0, so this kernel
-                // is guaranteed to visit it — clearing here keeps callers that
-                // reuse one info tensor across backwards from inflating row 1
-                // with norms of running sums.
-                densification_info[2 * n_primitives + primitive_idx] = 0.0f;
-                densification_info[3 * n_primitives + primitive_idx] = 0.0f;
-            }
             const float2 dL_dmean2d_ndc = 0.5f * make_float2(
-                g.x * width,
-                g.y * height
+                dL_dmean2d.x * width,
+                dL_dmean2d.y * height
             );
             densification_info[n_primitives + primitive_idx] += length(dL_dmean2d_ndc);
+            if (grad_mean2d_abs != nullptr) {
+                const float2 dL_dmean2d_abs = grad_mean2d_abs[primitive_idx];
+                const float2 dL_dmean2d_abs_ndc = 0.5f * make_float2(
+                    dL_dmean2d_abs.x * width,
+                    dL_dmean2d_abs.y * height
+                );
+                densification_info[2 * n_primitives + primitive_idx] += length(dL_dmean2d_abs_ndc);
+            }
         }
 
         // mean3d camera space gradient from mean2d
@@ -310,6 +335,7 @@ namespace faster_gs::rasterization::kernels::backward {
     }
 
     // based on https://github.com/humansensinglab/taming-3dgs/blob/fd0f7d9edfe135eb4eefd3be82ee56dada7f2a16/submodules/diff-gaussian-rasterization/cuda_rasterizer/backward.cu#L404
+    template <bool compute_abs_grad>
     __global__ void blend_backward_cu(
         const uint2* __restrict__ tile_instance_ranges,
         const uint* __restrict__ tile_bucket_offsets,
@@ -335,8 +361,7 @@ namespace faster_gs::rasterization::kernels::backward {
         float* __restrict__ grad_primitive_depth,
         float* __restrict__ grad_opacity,
         float3* __restrict__ grad_sh_coefficients_0,
-        float* __restrict__ densification_info,
-        const int densification_rows,
+        float2* __restrict__ grad_mean2d_abs,
         const uint n_primitives,
         const uint width,
         const uint height,
@@ -363,6 +388,7 @@ namespace faster_gs::rasterization::kernels::backward {
         uint primitive_idx = 0;
         float2 mean2d = {0.0f, 0.0f};
         float3 conic = {0.0f, 0.0f, 0.0f};
+        float3 conic_exp2 = {0.0f, 0.0f, 0.0f};
         float opacity = 0.0f;
         float3 color = {0.0f, 0.0f, 0.0f};
         float3 color_grad_factor = {0.0f, 0.0f, 0.0f};
@@ -372,6 +398,7 @@ namespace faster_gs::rasterization::kernels::backward {
             mean2d = primitive_mean2d[primitive_idx];
             const float4 conic_opacity = primitive_conic_opacity[primitive_idx];
             conic = make_float3(conic_opacity);
+            conic_exp2 = make_float3(scale_conic_for_exp2(conic_opacity));
             opacity = conic_opacity.w;
             const float3 color_unclamped = primitive_color[primitive_idx];
             color = fmaxf(color_unclamped, 0.0f);
@@ -387,10 +414,6 @@ namespace faster_gs::rasterization::kernels::backward {
 
         // gradient accumulation
         float2 dL_dmean2d_accum = {0.0f, 0.0f};
-        // absgrad (AbsGS): per-pixel |dL/dmean2d| accumulated component-wise, so
-        // opposing-sign contributions within a view cannot cancel. Lane owns the
-        // primitive here, so this register already holds the bucket-local sum —
-        // no warp reduction needed (unlike gsplat's pixel-per-thread layout).
         float2 dL_dmean2d_abs_accum = {0.0f, 0.0f};
         float3 dL_dconic_accum = {0.0f, 0.0f, 0.0f};
         float dL_dopacity_accum = 0.0f;
@@ -499,8 +522,8 @@ namespace faster_gs::rasterization::kernels::backward {
 
             const float2 pixel = make_float2(__uint2float_rn(pixel_coords.x), __uint2float_rn(pixel_coords.y)) + 0.5f;
             const float2 delta = mean2d - pixel;
-            const float exponent = -0.5f * (conic.x * delta.x * delta.x + conic.z * delta.y * delta.y) - conic.y * delta.x * delta.y;
-            const float gaussian = expf(fminf(exponent, 0.0f));
+            const float exponent = delta.x * (conic_exp2.x * delta.x + conic_exp2.y * delta.y) + conic_exp2.z * delta.y * delta.y;
+            const float gaussian = exp2f(fminf(exponent, 0.0f));
             if (!config::original_opacity_interpretation && gaussian < config::min_alpha_threshold) continue;
             const float alpha = opacity * gaussian;
             if (config::original_opacity_interpretation && alpha < config::min_alpha_threshold) continue;
@@ -547,9 +570,7 @@ namespace faster_gs::rasterization::kernels::backward {
                 conic.y * delta.x + conic.z * delta.y
             );
             dL_dmean2d_accum += dL_dmean2d;
-            if (densification_rows >= 4) {
-                dL_dmean2d_abs_accum += make_float2(fabsf(dL_dmean2d.x), fabsf(dL_dmean2d.y));
-            }
+            if constexpr (compute_abs_grad) dL_dmean2d_abs_accum += fabsf(dL_dmean2d);
 
             transmittance *= one_minus_alpha;
         }
@@ -558,9 +579,9 @@ namespace faster_gs::rasterization::kernels::backward {
         if (valid_primitive) {
             atomicAdd(&grad_mean2d[primitive_idx].x, dL_dmean2d_accum.x);
             atomicAdd(&grad_mean2d[primitive_idx].y, dL_dmean2d_accum.y);
-            if (densification_rows >= 4) {
-                atomicAdd(&densification_info[2 * n_primitives + primitive_idx], dL_dmean2d_abs_accum.x);
-                atomicAdd(&densification_info[3 * n_primitives + primitive_idx], dL_dmean2d_abs_accum.y);
+            if constexpr (compute_abs_grad) {
+                atomicAdd(&grad_mean2d_abs[primitive_idx].x, dL_dmean2d_abs_accum.x);
+                atomicAdd(&grad_mean2d_abs[primitive_idx].y, dL_dmean2d_abs_accum.y);
             }
             if (grad_primitive_depth != nullptr) {
                 atomicAdd(&grad_primitive_depth[primitive_idx], dL_ddepth_accum);

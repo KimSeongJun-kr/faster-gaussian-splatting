@@ -137,12 +137,12 @@ faster_gs::rasterization::backward_wrapper(
     const int n_primitives = means.size(0);
     const int total_sh_bases = sh_coefficients_rest.size(1);
     const torch::TensorOptions float_options = torch::TensorOptions().dtype(torch::kFloat).device(torch::kCUDA);
-    torch::Tensor grad_means = torch::zeros({n_primitives, 3}, float_options);
-    torch::Tensor grad_scales = torch::zeros({n_primitives, 3}, float_options);
-    torch::Tensor grad_rotations = torch::zeros({n_primitives, 4}, float_options);
+    torch::Tensor grad_means = torch::empty({n_primitives, 3}, float_options);
+    torch::Tensor grad_scales = torch::empty({n_primitives, 3}, float_options);
+    torch::Tensor grad_rotations = torch::empty({n_primitives, 4}, float_options);
     torch::Tensor grad_opacities = torch::zeros({n_primitives, 1}, float_options);
     torch::Tensor grad_sh_coefficients_0 = torch::zeros({n_primitives, 1, 3}, float_options);
-    torch::Tensor grad_sh_coefficients_rest = torch::zeros({n_primitives, total_sh_bases, 3}, float_options);
+    torch::Tensor grad_sh_coefficients_rest = torch::empty({n_primitives, total_sh_bases, 3}, float_options);
     torch::Tensor grad_mean2d_helper = torch::zeros({n_primitives, 2}, float_options);
     torch::Tensor grad_conic_helper = torch::zeros({3, n_primitives}, float_options);
     // dL/d(primitive camera-z) from the blend pass, consumed by preprocess_backward.
@@ -152,10 +152,9 @@ faster_gs::rasterization::backward_wrapper(
         : torch::empty({0}, float_options);
 
     const bool update_densification_info = densification_info.size(0) > 0;
-    // Row count doubles as the absgrad flag: (2, N) = plain, (4, N) = absgrad
-    // (rows 2/3 are component-wise |grad| scratch filled by the blend kernel).
-    // Keep the short-circuit order: callers may pass a 1-D empty tensor.
-    const int densification_rows = update_densification_info ? static_cast<int>(densification_info.size(0)) : 0;
+    const bool compute_abs_grad = densification_info.size(0) == 3;
+    torch::Tensor grad_mean2d_abs_helper;
+    if (compute_abs_grad) grad_mean2d_abs_helper = torch::zeros({n_primitives, 2}, float_options);
     TORCH_CHECK(!update_densification_info ||
                 (densification_info.is_contiguous() && densification_info.size(1) == n_primitives),
                 "densification_info must be a contiguous (rows, n_primitives) tensor");
@@ -187,8 +186,8 @@ faster_gs::rasterization::backward_wrapper(
         reinterpret_cast<float2*>(grad_mean2d_helper.data_ptr<float>()),
         grad_conic_helper.data_ptr<float>(),
         grad_depth_helper.data_ptr<float>(),
+        compute_abs_grad ? reinterpret_cast<float2*>(grad_mean2d_abs_helper.data_ptr<float>()) : nullptr,
         update_densification_info ? densification_info.data_ptr<float>() : nullptr,
-        densification_rows,
         compute_w2c_grad ? grad_w2c.data_ptr<float>() : nullptr,
         n_primitives,
         n_instances,
